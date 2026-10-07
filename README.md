@@ -4,7 +4,7 @@ Proyecto académico de Big Data para analizar trayectorias de taxis de Porto. La
 
 ## Estado
 
-Estructura inicial del proyecto. Los servicios y las instrucciones de despliegue se documentarán aquí a medida que se implementen.
+La infraestructura local inicial está definida en `docker-compose.yml`: MongoDB, un scheduler de Dask con dos workers y un master de Spark con un worker. La API Flask y Jenkins se agregarán en etapas posteriores.
 
 ## Dataset
 
@@ -19,4 +19,26 @@ El archivo original se obtiene de Kaggle mediante el pipeline y se guarda localm
 
 ## Ejecución
 
-Las instrucciones para levantar los servicios desde cero se agregarán cuando estén disponibles `docker-compose.yml` y los servicios del proyecto.
+Requiere Docker Desktop en ejecución y Docker Compose v2. Desde la raíz del proyecto:
+
+```powershell
+docker compose config
+docker compose up -d
+docker compose ps
+```
+
+Interfaces locales:
+
+- MongoDB: `mongodb://localhost:27017`
+- Panel de Dask: `http://localhost:8787`
+- Panel de Spark: `http://localhost:8081`
+- Panel del worker Spark: `http://localhost:8082`
+
+Para ver los registros o detener los servicios:
+
+```powershell
+docker compose logs -f
+docker compose down
+```
+
+MongoDB conserva sus datos en el volumen `mongodb_data`; `docker compose down` no lo elimina. No uses `docker compose down -v` si quieres conservarlos.
