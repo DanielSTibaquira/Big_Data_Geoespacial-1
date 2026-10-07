@@ -1,0 +1,36 @@
+# Dataset descargado desde Kaggle
+/data/*.csv
+/data/*.zip
+/data/*.gz
+
+# Salidas de análisis
+**/train_sample_extended.csv.gz
+
+# Credenciales y secretos
+.kaggle/
+kaggle.json
+**/kaggle.json
+.env
+.env.*
+!.env.example
+
+# Material de referencia del curso, conservado localmente
+/docs/reference/
+
+# Python
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Volúmenes y estado local de servicios
+mongo_data/
+jenkins_home/
+
+# Sistema operativo
+.DS_Store
+Thumbs.db
