@@ -1,0 +1,142 @@
+from __future__ import annotations
+
+from datetime import datetime, timezone
+
+from api.app import create_app
+
+
+class FakeCursor(list):
+    def limit(self, count):
+        return FakeCursor(self[:count])
+
+
+class FakeCollection:
+    def __init__(self, documents=None):
+        self.documents = documents or []
+        self.query = None
+        self.projection = None
+        self.indexes = []
+
+    def find(self, query, projection=None):
+        self.query = query
+        self.projection = projection
+        return FakeCursor(self.documents)
+
+    def create_index(self, keys):
+        self.indexes.append(keys)
+
+
+class FakeDatabase:
+    def __init__(self):
+        self.collections = {
+            "trips": FakeCollection(
+                [
+                    {
+                        "trip_id": "trip-1",
+                        "started_at": datetime(2013, 7, 1, tzinfo=timezone.utc),
+                    },
+                    {"trip_id": "trip-2"},
+                ]
+            ),
+            "trip_aggregates": FakeCollection([{"trip_count": 3}]),
+        }
+
+    def __getitem__(self, name):
+        return self.collections[name]
+
+
+class FakeClient:
+    def __init__(self):
+        self.database = FakeDatabase()
+        self.admin = self
+
+    def __getitem__(self, name):
+        return self.database
+
+    def command(self, command):
+        assert command == "ping"
+        return {"ok": 1}
+
+
+def create_test_client():
+    mongo = FakeClient()
+    app = create_app(mongo)
+    app.config.update(TESTING=True)
+    return app.test_client(), mongo
+
+
+def test_health_endpoint_checks_mongodb():
+    client, _ = create_test_client()
+
+    response = client.get("/health")
+
+    assert response.status_code == 200
+    assert response.json == {"status": "ok"}
+
+
+def test_near_endpoint_builds_meter_based_geo_near_query_and_caps_results():
+    client, mongo = create_test_client()
+
+    response = client.get(
+        "/api/v1/trips/near?longitude=-8.61&latitude=41.14&radius_m=500&limit=1"
+    )
+
+    assert response.status_code == 200
+    assert response.json["count"] == 1
+    assert mongo.database.collections["trips"].query == {
+        "location": {
+            "$near": {
+                "$geometry": {
+                    "type": "Point",
+                    "coordinates": [-8.61, 41.14],
+                },
+                "$maxDistance": 500,
+            }
+        }
+    }
+
+
+def test_within_endpoint_uses_a_closed_geojson_bounding_polygon():
+    client, mongo = create_test_client()
+
+    response = client.get(
+        "/api/v1/trips/within"
+        "?min_lon=-8.7&min_lat=41.1&max_lon=-8.5&max_lat=41.2"
+    )
+
+    assert response.status_code == 200
+    geometry = mongo.database.collections["trips"].query["location"]["$geoWithin"][
+        "$geometry"
+    ]
+    assert geometry["type"] == "Polygon"
+    assert geometry["coordinates"][0][0] == [-8.7, 41.1]
+    assert geometry["coordinates"][0][-1] == [-8.7, 41.1]
+
+
+def test_aggregate_endpoint_ensures_geospatial_index():
+    client, mongo = create_test_client()
+
+    response = client.get(
+        "/api/v1/aggregates/within"
+        "?min_lon=-8.7&min_lat=41.1&max_lon=-8.5&max_lat=41.2"
+    )
+
+    assert response.status_code == 200
+    assert mongo.database.collections["trip_aggregates"].indexes == [
+        [("cell_center", "2dsphere")]
+    ]
+
+
+def test_api_rejects_invalid_coordinates_and_bounding_boxes():
+    client, _ = create_test_client()
+
+    invalid_coordinate = client.get(
+        "/api/v1/trips/near?longitude=NaN&latitude=41.14&radius_m=500"
+    )
+    invalid_box = client.get(
+        "/api/v1/trips/within"
+        "?min_lon=-8.5&min_lat=41.1&max_lon=-8.7&max_lat=41.2"
+    )
+
+    assert invalid_coordinate.status_code == 400
+    assert invalid_box.status_code == 400

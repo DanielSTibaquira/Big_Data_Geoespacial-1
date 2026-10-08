@@ -1,0 +1,8 @@
+{
+  "engine": "spark",
+  "parallelism": 12,
+  "elapsed_seconds": 26.465663,
+  "valid_trip_count": 1704759,
+  "aggregate_group_count": 6781,
+  "input_file": "train.csv"
+}

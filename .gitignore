@@ -5,6 +5,7 @@
 
 # Salidas de análisis
 **/train_sample_extended.csv.gz
+/benchmark/results/*.json
 
 # Credenciales y secretos
 .kaggle/

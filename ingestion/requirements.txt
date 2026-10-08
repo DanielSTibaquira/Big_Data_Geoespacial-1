@@ -1,0 +1,2 @@
+dask[dataframe,distributed]==2026.8.0
+pymongo>=4.10,<5
