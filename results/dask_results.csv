@@ -1,0 +1,8 @@
+{
+  "engine": "dask",
+  "parallelism": 2,
+  "elapsed_seconds": 28.848796,
+  "valid_trip_count": 1704759,
+  "aggregate_group_count": 6781,
+  "input_file": "train.csv"
+}
