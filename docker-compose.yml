@@ -41,6 +41,8 @@ services:
       - 1GiB
     depends_on:
       - dask-scheduler
+    volumes:
+      - ./data:/data:ro
 
   dask-worker-2:
     image: daskdev/dask:2026.8.0-py3.12
@@ -54,6 +56,8 @@ services:
       - 1GiB
     depends_on:
       - dask-scheduler
+    volumes:
+      - ./data:/data:ro
 
   spark-master:
     image: apache/spark:3.5.7
@@ -86,6 +90,30 @@ services:
       - spark-master
     ports:
       - "127.0.0.1:8082:8081"
+
+  ingest:
+    build:
+      context: ./ingestion
+    profiles:
+      - jobs
+    environment:
+      DATA_PATH: /data/train.csv
+      MONGO_URI: mongodb://mongodb:27017
+      MONGO_DATABASE: taxi_geospatial
+      MONGO_COLLECTION: trips
+      DASK_SCHEDULER_ADDRESS: tcp://dask-scheduler:8786
+      DASK_EXPECTED_WORKERS: "2"
+    volumes:
+      - ./data:/data:ro
+    depends_on:
+      mongodb:
+        condition: service_healthy
+      dask-scheduler:
+        condition: service_started
+      dask-worker-1:
+        condition: service_started
+      dask-worker-2:
+        condition: service_started
 
 volumes:
   mongodb_data:

@@ -42,3 +42,20 @@ docker compose down
 ```
 
 MongoDB conserva sus datos en el volumen `mongodb_data`; `docker compose down` no lo elimina. No uses `docker compose down -v` si quieres conservarlos.
+
+### Ingesta de datos
+
+Coloca `train.csv` en `data/` (el archivo y sus copias comprimidas no se versionan). Para construir la imagen de ingesta y probar primero con 5.000 filas:
+
+```powershell
+docker compose --profile jobs build ingest
+docker compose --profile jobs run --rm ingest --limit 5000
+```
+
+Para procesar todo el archivo, omite `--limit`:
+
+```powershell
+docker compose --profile jobs run --rm ingest
+```
+
+El proceso usa Dask del clúster de Compose, convierte origen/destino a puntos GeoJSON, descarta registros con datos o coordenadas inválidos, hace upsert por lotes en `taxi_geospatial.trips` y crea el índice `location_2dsphere`. El `_id` se deriva de una huella estable de la fila completa: así, reejecutar la ingesta no duplica filas idénticas y no se pierden viajes distintos que compartan `TRIP_ID`.
