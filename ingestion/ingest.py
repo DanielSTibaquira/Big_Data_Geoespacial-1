@@ -215,6 +215,8 @@ def parse_args() -> argparse.Namespace:
 
 
 def _make_client(scheduler_address: str | None) -> Client:
+    # Usa el clúster de Compose si hay scheduler configurado; de lo contrario,
+    # crea un clúster local para poder ejecutar la ingesta fuera de Compose.
     if scheduler_address:
         return Client(scheduler_address)
     return Client(n_workers=2, threads_per_worker=1, processes=True)
@@ -242,6 +244,8 @@ def _upsert_documents(
 def _read_limited_sample(
     dataframe: dd.DataFrame, limit: int, client: Client
 ) -> pd.DataFrame:
+    # Para --limit se materializan particiones hasta reunir las primeras N filas.
+    # Solo se usa para pruebas pequeñas; la ingesta normal conserva el flujo Dask.
     sample_partitions: list[pd.DataFrame] = []
     rows_read = 0
 
@@ -267,6 +271,8 @@ def ingest(args: argparse.Namespace) -> dict[str, int]:
     mongo_client: MongoClient[dict[str, Any]] | None = None
     try:
         if args.scheduler_address:
+            # Evita empezar el trabajo distribuido antes de que estén disponibles
+            # los workers esperados en el clúster de Compose.
             client.wait_for_workers(args.expected_workers, timeout=120)
 
         mongo_client = MongoClient(args.mongo_uri, serverSelectionTimeoutMS=5000)
@@ -276,6 +282,8 @@ def ingest(args: argparse.Namespace) -> dict[str, int]:
         ]
         collection.create_index([("location", "2dsphere")], name="location_2dsphere")
 
+        # Dask describe aquí una lectura particionada y diferida: el CSV se procesa
+        # cuando el cliente envía las tareas al clúster, no al crear este dataframe.
         ddf = dd.read_csv(
             args.csv,
             usecols=CSV_COLUMNS,
@@ -284,10 +292,13 @@ def ingest(args: argparse.Namespace) -> dict[str, int]:
             blocksize=args.blocksize,
         )
         if args.limit is not None:
+            # --limit reduce la entrada a una muestra pequeña antes de transformarla.
             sample = _read_limited_sample(ddf, args.limit, client)
             number_of_partitions = max(1, min(2, len(sample)))
             ddf = dd.from_pandas(sample, npartitions=number_of_partitions)
 
+        # Cada partición de Dask se transforma en documentos y contadores mediante
+        # transform_partition; las tareas se envían en grupos acotados de particiones.
         delayed_partitions = [
             dask.delayed(transform_partition)(partition)
             for partition in ddf.to_delayed()
@@ -301,6 +312,8 @@ def ingest(args: argparse.Namespace) -> dict[str, int]:
             futures = client.compute(task_batch)
             partition_results = client.gather(futures)
 
+            # Las transformaciones se ejecutan en workers Dask; sus resultados vuelven
+            # al proceso de ingesta, que realiza los upserts por lotes en MongoDB.
             for documents, counters in partition_results:
                 totals.update(counters)
                 upserted, modified = _upsert_documents(

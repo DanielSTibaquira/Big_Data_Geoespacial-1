@@ -73,6 +73,11 @@ services:
     ports:
       - "127.0.0.1:7077:7077"
       - "127.0.0.1:8081:8080"
+    volumes:
+      - ./spark:/opt/spark-apps:ro
+      - ./benchmark:/opt/benchmark:ro
+      - ./data:/data:ro
+      - ./benchmark/results:/results
 
   spark-worker:
     image: apache/spark:3.5.7
@@ -90,6 +95,49 @@ services:
       - spark-master
     ports:
       - "127.0.0.1:8082:8081"
+    volumes:
+      - ./spark:/opt/spark-apps:ro
+      - ./benchmark:/opt/benchmark:ro
+      - ./data:/data:ro
+
+  api:
+    build:
+      context: ./api
+    restart: unless-stopped
+    environment:
+      MONGO_URI: mongodb://mongodb:27017
+      MONGO_DATABASE: taxi_geospatial
+      MONGO_COLLECTION: trips
+      MONGO_AGGREGATES_COLLECTION: trip_aggregates
+    ports:
+      - "127.0.0.1:5000:5000"
+    depends_on:
+      mongodb:
+        condition: service_healthy
+
+  benchmark-dask:
+    image: daskdev/dask:2026.8.0-py3.12
+    profiles:
+      - benchmark
+    working_dir: /opt/benchmark
+    entrypoint: ["python", "dask_aggregate.py"]
+    volumes:
+      - ./benchmark:/opt/benchmark:ro
+      - ./data:/data:ro
+      - ./benchmark/results:/results
+
+  jenkins:
+    build:
+      context: ./jenkins
+    profiles:
+      - ci
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8080:8080"
+      - "127.0.0.1:50000:50000"
+    volumes:
+      - jenkins_home:/var/jenkins_home
+      - ./data:/data
 
   ingest:
     build:
@@ -117,3 +165,4 @@ services:
 
 volumes:
   mongodb_data:
+  jenkins_home:

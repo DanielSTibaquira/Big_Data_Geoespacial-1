@@ -4,11 +4,11 @@ Proyecto académico de Big Data para analizar trayectorias de taxis de Porto. La
 
 ## Estado
 
-La infraestructura local inicial está definida en `docker-compose.yml`: MongoDB, un scheduler de Dask con dos workers y un master de Spark con un worker. La API Flask y Jenkins se agregarán en etapas posteriores.
+La infraestructura local está definida en `docker-compose.yml`: MongoDB, Dask, Spark y una API Flask. Jenkins y los contenedores de benchmark se activan con perfiles opcionales.
 
 ## Dataset
 
-El archivo original se obtiene de Kaggle mediante el pipeline y se guarda localmente en `data/`. Los CSV y ZIP están excluidos de Git por su tamaño. Las credenciales de Kaggle se administran fuera del repositorio; no agregues tokens ni archivos `kaggle.json`.
+El archivo original es [Taxi Trajectory Data](https://www.kaggle.com/datasets/crailtap/taxi-trajectory), de aproximadamente 1,94 GB. Jenkins lo descarga automáticamente cuando `/data/train.csv` no existe; los CSV y ZIP están excluidos de Git. Las credenciales de Kaggle se administran en Jenkins y nunca deben agregarse al repositorio.
 
 ## Carpetas
 
@@ -16,6 +16,9 @@ El archivo original se obtiene de Kaggle mediante el pipeline y se guarda localm
 - `notebooks/`: notebooks de exploración y análisis.
 - `docs/`: documentación del proyecto, arquitectura e informe.
 - `docs/reference/`: material de referencia local, excluido de Git.
+- `api/`: API REST Flask para consultas espaciales.
+- `benchmark/`: jobs equivalentes de agregación con Dask y Spark.
+- `jenkins/`: imagen personalizada del controlador Jenkins.
 
 ## Ejecución
 
@@ -33,6 +36,7 @@ Interfaces locales:
 - Panel de Dask: `http://localhost:8787`
 - Panel de Spark: `http://localhost:8081`
 - Panel del worker Spark: `http://localhost:8082`
+- API Flask: `http://localhost:5000`
 
 Para ver los registros o detener los servicios:
 
@@ -59,3 +63,89 @@ docker compose --profile jobs run --rm ingest
 ```
 
 El proceso usa Dask del clúster de Compose, convierte origen/destino a puntos GeoJSON, descarta registros con datos o coordenadas inválidos, hace upsert por lotes en `taxi_geospatial.trips` y crea el índice `location_2dsphere`. El `_id` se deriva de una huella estable de la fila completa: así, reejecutar la ingesta no duplica filas idénticas y no se pierden viajes distintos que compartan `TRIP_ID`.
+
+### Agregación espacial y temporal con Spark
+
+`spark/jobs/aggregate_trips.py` lee `taxi_geospatial.trips` con MongoDB Spark Connector y agrupa los viajes por celdas de `0.01°` y hora UTC. Guarda el centro GeoJSON de cada celda y su conteo en `taxi_geospatial.trip_aggregates`. Para ejecutar el job:
+
+```powershell
+docker compose up -d spark-master spark-worker
+docker compose exec spark-master sh -c 'mkdir -p /tmp/spark-ivy/cache && /opt/spark/bin/spark-submit --master spark://spark-master:7077 --packages org.mongodb.spark:mongo-spark-connector_2.12:10.7.0 --conf spark.jars.ivy=/tmp/spark-ivy --conf spark.mongodb.read.connection.uri=mongodb://mongodb:27017/taxi_geospatial.trips --conf spark.mongodb.write.connection.uri=mongodb://mongodb:27017/taxi_geospatial.trip_aggregates /opt/spark-apps/jobs/aggregate_trips.py'
+```
+
+El modo `overwrite` reemplaza la colección de agregados al volver a ejecutar el job; no altera `trips`. Para validar en MongoDB Compass o en MongoDB shell, el total de `trip_count` debe coincidir con el total de documentos de origen:
+
+```javascript
+db.trips.countDocuments({})
+db.trip_aggregates.countDocuments({})
+db.trip_aggregates.aggregate([
+  { $group: { _id: null, total: { $sum: "$trip_count" } } }
+])
+```
+
+### API Flask
+
+La API escucha en `http://localhost:5000`. Rutas disponibles:
+
+```text
+GET /health
+GET /api/v1/trips/near?longitude=-8.61&latitude=41.14&radius_m=500&limit=100
+GET /api/v1/trips/within?min_lon=-8.7&min_lat=41.1&max_lon=-8.5&max_lat=41.2&limit=100
+GET /api/v1/aggregates/within?min_lon=-8.7&min_lat=41.1&max_lon=-8.5&max_lat=41.2&limit=100
+```
+
+Las rutas `within` aceptan una caja rectangular WGS84 y la convierten a un polígono GeoJSON. La búsqueda de viajes usa el índice `location_2dsphere` creado durante la ingesta; la consulta de agregados crea de forma idempotente el índice `cell_center_2dsphere`. Los parámetros inválidos devuelven HTTP 400 y los errores de MongoDB HTTP 503.
+
+### Benchmark Dask/Spark
+
+Ambos jobs leen las mismas columnas de `data/train.csv` y agrupan el punto inicial por celda de `0.01°` y hora UTC. Inicia Spark y prepara el directorio de resultados:
+
+```powershell
+docker compose up -d spark-master spark-worker
+New-Item -ItemType Directory -Force benchmark/results
+```
+
+Ejecuta Dask con una y dos instancias worker:
+
+```powershell
+docker compose --profile benchmark run --rm benchmark-dask --workers 1 --csv /data/train.csv --output /results/dask-1.json
+docker compose --profile benchmark run --rm benchmark-dask --workers 2 --csv /data/train.csv --output /results/dask-2.json
+```
+
+Ejecuta Spark en modo local con uno y dos slots:
+
+```powershell
+docker compose exec spark-master /opt/spark/bin/spark-submit --master 'local[1]' /opt/benchmark/spark_aggregate.py --csv /data/train.csv --output /results/spark-1.json
+docker compose exec spark-master /opt/spark/bin/spark-submit --master 'local[2]' /opt/benchmark/spark_aggregate.py --csv /data/train.csv --output /results/spark-2.json
+```
+
+Cada ejecución imprime y guarda JSON con duración, paralelismo, grupos y viajes válidos. Compara `valid_trip_count` y `aggregate_group_count` entre motores antes de interpretar los tiempos; las ejecuciones en Docker no sustituyen una medición controlada de hardware.
+
+Medición realizada sobre el CSV completo en el entorno local del proyecto:
+
+| Motor | Paralelismo | Tiempo (s) | Viajes válidos | Grupos |
+|---|---:|---:|---:|---:|
+| Dask | 1 worker | 136.33 | 1,704,759 | 6,781 |
+| Dask | 2 workers | 81.02 | 1,704,759 | 6,781 |
+| Spark | `local[1]` | 190.03 | 1,704,759 | 6,781 |
+| Spark | `local[2]` | 108.19 | 1,704,759 | 6,781 |
+
+Es una única ejecución por configuración; los tiempos dependen de la máquina, caché y carga del sistema, y no deben generalizarse.
+
+### Jenkins y descarga automatizada de Kaggle
+
+Inicia Jenkins bajo el perfil `ci`:
+
+```powershell
+docker compose --profile ci up -d --build jenkins
+docker compose --profile ci logs jenkins
+```
+
+Abre `http://localhost:8080`, termina el asistente inicial, instala los plugins **Pipeline** y **Credentials Binding**, y crea una credencial **Secret file** con ID `kaggle-json` a partir de tu archivo local de Kaggle. Crea un job **Pipeline** conectado al repositorio y selecciona `Jenkinsfile`. El job ejecuta las pruebas y descarga `crailtap/taxi-trajectory` a `data/train.csv` si aún no existe; marca `FORCE_DATASET_DOWNLOAD` para actualizarlo. El volumen `jenkins_home` conserva la configuración de Jenkins y `./data` comparte el CSV con los servicios del proyecto.
+
+### Pruebas locales
+
+```powershell
+python -m pip install -r requirements-dev.txt
+python -m pytest -q
+```
