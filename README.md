@@ -113,25 +113,25 @@ docker compose --profile benchmark run --rm benchmark-dask --workers 1 --csv /da
 docker compose --profile benchmark run --rm benchmark-dask --workers 2 --csv /data/train.csv --output /results/dask-2.json
 ```
 
-Ejecuta Spark en modo local con uno y dos slots:
+Ejecuta Spark en contenedores aislados, en modo local con uno y dos slots:
 
 ```powershell
-docker compose exec spark-master /opt/spark/bin/spark-submit --master 'local[1]' /opt/benchmark/spark_aggregate.py --csv /data/train.csv --output /results/spark-1.json
-docker compose exec spark-master /opt/spark/bin/spark-submit --master 'local[2]' /opt/benchmark/spark_aggregate.py --csv /data/train.csv --output /results/spark-2.json
+docker compose --profile benchmark run --rm benchmark-spark /opt/benchmark/spark_aggregate.py --master 'local[1]' --csv /data/train.csv --output /results/spark-1.json
+docker compose --profile benchmark run --rm benchmark-spark /opt/benchmark/spark_aggregate.py --master 'local[2]' --csv /data/train.csv --output /results/spark-2.json
 ```
 
-Cada ejecución imprime y guarda JSON con duración, paralelismo, grupos y viajes válidos. Compara `valid_trip_count` y `aggregate_group_count` entre motores antes de interpretar los tiempos; las ejecuciones en Docker no sustituyen una medición controlada de hardware.
+Cada ejecución imprime y guarda JSON con duración, paralelismo, grupos, viajes válidos y pico de memoria (`peak_memory_mib`). La memoria se lee del cgroup v2 (`memory.peak`) o v1 (`memory.max_usage_in_bytes`) del contenedor efímero e incluye el runtime de Dask/Spark y sus workers/JVM. Si el entorno no expone estas métricas, el benchmark falla explícitamente en vez de reportar un valor inventado. Compara `valid_trip_count` y `aggregate_group_count` entre motores antes de interpretar tiempos o memoria; las ejecuciones en Docker no sustituyen una medición controlada de hardware.
 
-Medición realizada sobre el CSV completo en el entorno local del proyecto:
+Medición realizada sobre el CSV completo en el entorno local del proyecto (memoria máxima observada del contenedor):
 
-| Motor | Paralelismo | Tiempo (s) | Viajes válidos | Grupos |
-|---|---:|---:|---:|---:|
-| Dask | 1 worker | 136.33 | 1,704,759 | 6,781 |
-| Dask | 2 workers | 81.02 | 1,704,759 | 6,781 |
-| Spark | `local[1]` | 190.03 | 1,704,759 | 6,781 |
-| Spark | `local[2]` | 108.19 | 1,704,759 | 6,781 |
+| Motor | Paralelismo | Tiempo (s) | Pico memoria (MiB) | Viajes válidos | Grupos |
+|---|---:|---:|---:|---:|---:|
+| Dask | 1 worker | 83.90 | 668.44 | 1,704,759 | 6,781 |
+| Dask | 2 workers | 39.75 | 765.50 | 1,704,759 | 6,781 |
+| Spark | `local[1]` | 124.41 | 870.54 | 1,704,759 | 6,781 |
+| Spark | `local[2]` | 70.05 | 716.17 | 1,704,759 | 6,781 |
 
-Es una única ejecución por configuración; los tiempos dependen de la máquina, caché y carga del sistema, y no deben generalizarse.
+En estas ejecuciones Dask tardó menos que Spark en ambas configuraciones: 83.90 frente a 124.41 s con paralelismo 1 y 39.75 frente a 70.05 s con paralelismo 2. Su pico fue menor con paralelismo 1 (668.44 frente a 870.54 MiB), pero algo mayor con paralelismo 2 (765.50 frente a 716.17 MiB). Aumentar paralelismo redujo el tiempo en ambos motores; el pico subió en Dask y bajó en Spark, así que no crece necesariamente de forma lineal por asignación del heap, GC y variabilidad de una sola corrida. Para esta agregación Dask mostró menor tiempo; Spark ofrece mejor integración con procesamiento distribuido conectado a MongoDB. No se debe generalizar: tiempos y memoria dependen de la máquina, caché y carga del sistema.
 
 ### Jenkins y descarga automatizada de Kaggle
 
@@ -142,7 +142,9 @@ docker compose --profile ci up -d --build jenkins
 docker compose --profile ci logs jenkins
 ```
 
-Abre `http://localhost:8080`, termina el asistente inicial y crea una credencial **Secret file** con ID `kaggle-json` a partir de tu archivo local de Kaggle. La imagen instala los plugins de **GitHub**, **Pipeline** y **Credentials Binding**. Crea un job **Pipeline** conectado al repositorio y selecciona `Jenkinsfile`; el pipeline declara el trigger `githubPush()`. El job ejecuta las pruebas y descarga `crailtap/taxi-trajectory` a `data/train.csv` si aún no existe; marca `FORCE_DATASET_DOWNLOAD` para actualizarlo. El volumen `jenkins_home` conserva la configuración de Jenkins y `./data` comparte el CSV con los servicios del proyecto.
+Abre `http://localhost:8080`, termina el asistente inicial y crea una credencial **Secret file** con ID `kaggle-json` a partir de tu archivo local de Kaggle. La imagen instala Docker CLI/Compose y los plugins de **GitHub**, **Pipeline** y **Credentials Binding**. Crea un job **Pipeline** conectado al repositorio y selecciona `Jenkinsfile`; el pipeline declara el trigger `githubPush()`. El job descarga `crailtap/taxi-trajectory` a `data/train.csv` si aún no existe, ejecuta pytest, construye la imagen de API, levanta una API candidata y MongoDB, y consulta `http://api-ci:5000/health` desde Jenkins. Solo si la candidata responde correctamente, actualiza el servicio `api`; marca `FORCE_DATASET_DOWNLOAD` para forzar la descarga. El parámetro `COMPOSE_PROJECT_NAME` debe coincidir con el proyecto donde corre Jenkins (en este entorno: `parcial`).
+
+Jenkins monta `/var/run/docker.sock` para ejecutar el despliegue en el Docker del equipo. **Ese socket otorga a los jobs control prácticamente administrativo sobre Docker y los contenedores del host**; úsalo solo en este entorno local y no ejecutes cambios de repositorios o ramas no confiables. En Linux, si Jenkins no puede acceder al socket, define `DOCKER_GID` con el grupo propietario del socket antes de recrear el servicio. El volumen `jenkins_home` conserva la configuración y `./data` comparte el CSV con los servicios del proyecto.
 
 Para que GitHub dispare el webhook, Jenkins debe tener una URL HTTPS pública alcanzable desde GitHub: la dirección local `http://localhost:8080` no es accesible desde Internet. En **Settings → Webhooks → Add webhook**, usa `<URL pública de Jenkins>/github-webhook/`, selecciona `application/json` y el evento **Just the push event**. No expongas directamente el puerto de desarrollo sin un túnel/reverse proxy HTTPS protegido. Después de guardar el webhook, verifica el evento en la pestaña **Recent Deliveries** y que Jenkins inicie el job.
 

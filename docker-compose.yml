@@ -101,6 +101,7 @@ services:
       - ./data:/data:ro
 
   api:
+    image: taxi-geospatial-api:local
     build:
       context: ./api
     restart: unless-stopped
@@ -119,12 +120,42 @@ services:
     image: daskdev/dask:2026.8.0-py3.12
     profiles:
       - benchmark
+    environment:
+      PYTHONPATH: /opt
     working_dir: /opt/benchmark
     entrypoint: ["python", "dask_aggregate.py"]
     volumes:
       - ./benchmark:/opt/benchmark:ro
       - ./data:/data:ro
       - ./benchmark/results:/results
+
+  benchmark-spark:
+    image: apache/spark:3.5.7
+    profiles:
+      - benchmark
+    environment:
+      PYTHONPATH: /opt
+    working_dir: /opt/benchmark
+    entrypoint: ["/opt/spark/bin/spark-submit"]
+    volumes:
+      - ./benchmark:/opt/benchmark:ro
+      - ./data:/data:ro
+      - ./benchmark/results:/results
+
+  api-ci:
+    image: taxi-geospatial-api:local
+    build:
+      context: ./api
+    profiles:
+      - ci-deploy
+    environment:
+      MONGO_URI: mongodb://mongodb:27017
+      MONGO_DATABASE: taxi_geospatial
+      MONGO_COLLECTION: trips
+      MONGO_AGGREGATES_COLLECTION: trip_aggregates
+    depends_on:
+      mongodb:
+        condition: service_healthy
 
   jenkins:
     build:
@@ -135,9 +166,14 @@ services:
     ports:
       - "127.0.0.1:8080:8080"
       - "127.0.0.1:50000:50000"
+    environment:
+      COMPOSE_PROJECT_NAME: ${COMPOSE_PROJECT_NAME:-parcial}
     volumes:
       - jenkins_home:/var/jenkins_home
       - ./data:/data
+      - /var/run/docker.sock:/var/run/docker.sock
+    group_add:
+      - "${DOCKER_GID:-0}"
 
   ingest:
     build:

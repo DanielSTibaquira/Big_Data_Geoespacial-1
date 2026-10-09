@@ -5,7 +5,7 @@
 
 ## Resumen
 
-Este proyecto implementa un flujo reproducible para explorar y procesar trayectorias de taxis de Porto, Portugal. Los registros se limpian y transforman con Dask, se almacenan como puntos GeoJSON en MongoDB y se agregan por celda espacial y hora con Apache Spark. Una API Flask expone consultas geoespaciales de proximidad, contención y agregación. También se prepararon benchmarks de Dask y Spark y un pipeline Jenkins que obtiene el conjunto de datos desde Kaggle y ejecuta las pruebas.
+Este proyecto implementa un flujo reproducible para explorar y procesar trayectorias de taxis de Porto, Portugal. Los registros se limpian y transforman con Dask, se almacenan como puntos GeoJSON en MongoDB y se agregan por celda espacial y hora con Apache Spark. Una API Flask expone consultas geoespaciales de proximidad, contención y agregación. Los benchmarks comparan tiempo y pico de memoria de Dask y Spark; Jenkins obtiene el conjunto de datos, prueba la API candidata y despliega la imagen solo si las pruebas y el smoke test pasan.
 
 En el CSV de 1.710.670 viajes se validaron 1.704.759 registros para la ingesta. Dos filas válidas idénticas se consolidan en MongoDB mediante una clave idempotente, dejando 1.704.757 documentos únicos. La agregación Spark cubrió esos documentos en 6.781 grupos; la suma de sus conteos coincide con el total cargado.
 
@@ -70,27 +70,27 @@ Las consultas geoespaciales aseguran la existencia del índice `2dsphere` corres
 
 Ambos jobs realizan una operación equivalente sobre el mismo CSV: extraen el origen, agrupan por celda de 0,01 grados y hora UTC y reportan duración, cantidad de viajes y grupos.
 
-| Motor | Paralelismo | Tiempo (s) | Viajes válidos | Grupos |
-|---|---:|---:|---:|---:|
-| Dask | 1 worker | 136,33 | 1.704.759 | 6.781 |
-| Dask | 2 workers | 81,02 | 1.704.759 | 6.781 |
-| Spark | `local[1]` | 190,03 | 1.704.759 | 6.781 |
-| Spark | `local[2]` | 108,19 | 1.704.759 | 6.781 |
+| Motor | Paralelismo | Tiempo (s) | Pico memoria (MiB) | Viajes válidos | Grupos |
+|---|---:|---:|---:|---:|---:|
+| Dask | 1 worker | 83,90 | 668,44 | 1.704.759 | 6.781 |
+| Dask | 2 workers | 39,75 | 765,50 | 1.704.759 | 6.781 |
+| Spark | `local[1]` | 124,41 | 870,54 | 1.704.759 | 6.781 |
+| Spark | `local[2]` | 70,05 | 716,17 | 1.704.759 | 6.781 |
 
-En esta ejecución local, aumentar de uno a dos workers/slots redujo el tiempo de ambos motores. Dask fue más rápido en las configuraciones medidas; no se debe generalizar el resultado: se midió una ejecución por configuración y los tiempos dependen de hardware, caché, JVM y carga de fondo. GitHub contiene además mediciones hechas por otro integrante con distinta configuración (Dask con paralelismo 2 y Spark con 12); no son una comparación controlada entre motores.
+El pico de memoria se obtiene de `memory.peak` (cgroup v2) o `memory.max_usage_in_bytes` (cgroup v1) de cada contenedor efímero, e incluye JVM/workers y su inicialización. La medición depende del límite y soporte de cgroups del entorno Docker. Dask fue más rápido que Spark en las dos configuraciones: 83,90 frente a 124,41 s con paralelismo 1 y 39,75 frente a 70,05 s con paralelismo 2. Su pico fue menor con paralelismo 1 (668,44 frente a 870,54 MiB) y ligeramente mayor con paralelismo 2 (765,50 frente a 716,17 MiB). Aumentar paralelismo redujo el tiempo en ambos; el pico subió en Dask y bajó en Spark, lo cual puede depender del heap, GC y variabilidad de una sola corrida. Para esta agregación Dask fue más rápido; Spark resulta conveniente para el procesamiento distribuido ya conectado a MongoDB. No se debe generalizar: se midió una ejecución por configuración y los resultados dependen de hardware, caché, JVM y carga de fondo. GitHub contiene además mediciones hechas por otro integrante con distinta configuración (Dask con paralelismo 2 y Spark con 12); no son una comparación controlada entre motores.
 
 ## Automatización y pruebas
 
-`Jenkinsfile` define checkout, descarga condicional del dataset y ejecución de pruebas. Jenkins necesita credenciales Kaggle. Para recibir eventos push, se habilitó el trigger `githubPush()` y el plugin correspondiente; GitHub debe poder alcanzar el endpoint HTTPS público `/github-webhook/`. La instancia Compose de desarrollo está enlazada a `127.0.0.1`, por lo que el webhook remoto no funcionará hasta configurar un endpoint público seguro y registrar la URL en los ajustes del repositorio. La URL real no está configurada en este documento.
+`Jenkinsfile` define checkout, descarga condicional del dataset, pytest, build de la imagen API, despliegue temporal de una candidata y solicitud a `/health`. Si el smoke test responde con `{"status":"ok"}`, Jenkins actualiza el servicio `api`; en caso contrario, elimina la candidata y no despliega la versión nueva. Jenkins comparte la red y el proyecto Compose existente (`parcial` por defecto), por lo que el parámetro `COMPOSE_PROJECT_NAME` debe coincidir con el proyecto local. La imagen Jenkins incluye Docker CLI/Compose y monta `/var/run/docker.sock`; este socket concede control prácticamente administrativo al daemon y se reserva para el equipo local de desarrollo. Para recibir eventos push, se habilitó y probó el trigger `githubPush()` mediante el webhook HTTPS público `/github-webhook/`; la URL del túnel es temporal y debe mantenerse activa durante la demostración.
 
-La suite local incluye 16 pruebas de transformación, API, construcción de consultas y agrupación; las 16 pasaron al validar estos cambios. La prueba del pipeline `$geoNear` comprueba que sea la primera etapa, use coordenadas WGS84 y radio en metros, y agrupe por tipo de llamada.
+La suite incluye pruebas de transformación, API, construcción de consultas, agrupación y lectura de la métrica cgroup. Debe ejecutarse antes de construir y desplegar; el pipeline también valida `/health` contra una API candidata en Docker.
 
 ## Limitaciones y trabajo futuro
 
-- El benchmark mide la agregación sobre CSV local y no mide consumo de memoria ni coste de transferencia/lectura desde MongoDB.
+- El benchmark mide la agregación sobre CSV local; el pico cgroup representa el contenedor completo, no el RSS aislado de cada proceso, y depende del soporte de memoria cgroup de Docker.
 - Las celdas se definen en grados y no tienen área métrica constante; son apropiadas para esta demostración local, no para análisis de área de alta precisión.
-- La descarga automatizada y el webhook dependen de credenciales y configuración externa de Jenkins/GitHub; no se incluyen secretos ni datos grandes en Git.
-- La exploración adicional puede incluir filtros temporales, comparación de áreas geográficas no rectangulares, mediciones repetidas con estadística y un despliegue Jenkins con HTTPS.
+- La descarga automatizada y el webhook dependen de credenciales y configuración externa de Jenkins/GitHub; no se incluyen secretos ni datos grandes en Git. El despliegue desde Jenkins requiere el socket Docker y no debe habilitarse para código no confiable.
+- Las mediciones reportadas corresponden a una ejecución por configuración; repetirlas y calcular estadísticos permitiría conclusiones más robustas.
 
 ## Reproducción
 

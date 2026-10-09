@@ -12,6 +12,8 @@ import dask.dataframe as dd
 import pandas as pd
 from dask.distributed import Client, LocalCluster
 
+from benchmark.memory import peak_memory_bytes
+
 CELL_SIZE_DEGREES = 0.01
 INPUT_COLUMNS = ["TIMESTAMP", "MISSING_DATA", "POLYLINE"]
 OUTPUT_COLUMNS = ["grid_lon", "grid_lat", "hour_utc"]
@@ -105,11 +107,15 @@ def main() -> None:
         trips = source.map_partitions(_aggregate_partition, meta=meta)
         counts = trips.groupby(OUTPUT_COLUMNS).size(split_out=args.split_out).compute()
         elapsed = time.perf_counter() - started
+        memory_peak = peak_memory_bytes()
 
         result: dict[str, Any] = {
             "engine": "dask",
             "parallelism": args.workers,
             "elapsed_seconds": round(elapsed, 6),
+            "peak_memory_bytes": memory_peak,
+            "peak_memory_mib": round(memory_peak / (1024**2), 2),
+            "memory_measurement": "container cgroup peak since container start",
             "valid_trip_count": int(counts.sum()),
             "aggregate_group_count": int(len(counts)),
             "input_file": args.csv.name,
