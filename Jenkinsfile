@@ -6,6 +6,10 @@ pipeline {
         timestamps()
     }
 
+    triggers {
+        githubPush()
+    }
+
     parameters {
         booleanParam(
             name: 'FORCE_DATASET_DOWNLOAD',

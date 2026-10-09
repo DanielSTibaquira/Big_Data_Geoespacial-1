@@ -14,6 +14,7 @@ class FakeCollection:
     def __init__(self, documents=None):
         self.documents = documents or []
         self.query = None
+        self.pipeline = None
         self.projection = None
         self.indexes = []
 
@@ -24,6 +25,10 @@ class FakeCollection:
 
     def create_index(self, keys):
         self.indexes.append(keys)
+
+    def aggregate(self, pipeline):
+        self.pipeline = pipeline
+        return FakeCursor([{"_id": "A", "trip_count": 3}])
 
 
 class FakeDatabase:
@@ -111,6 +116,25 @@ def test_within_endpoint_uses_a_closed_geojson_bounding_polygon():
     assert geometry["type"] == "Polygon"
     assert geometry["coordinates"][0][0] == [-8.7, 41.1]
     assert geometry["coordinates"][0][-1] == [-8.7, 41.1]
+
+def test_near_aggregation_uses_geonear_then_groups_by_call_type():
+    client, mongo = create_test_client()
+
+    response = client.get(
+        "/api/v1/trips/aggregate/near"
+        "?longitude=-8.61&latitude=41.14&radius_m=500"
+    )
+
+    trips = mongo.database.collections["trips"]
+    assert response.status_code == 200
+    assert response.json["results"] == [{"_id": "A", "trip_count": 3}]
+    assert trips.pipeline[0]["$geoNear"]["near"] == {
+        "type": "Point",
+        "coordinates": [-8.61, 41.14],
+    }
+    assert trips.pipeline[0]["$geoNear"]["maxDistance"] == 500
+    assert trips.pipeline[1]["$group"]["_id"] == "$call_type"
+    assert trips.indexes == [[("location", "2dsphere")]]
 
 
 def test_aggregate_endpoint_ensures_geospatial_index():

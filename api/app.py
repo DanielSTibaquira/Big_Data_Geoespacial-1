@@ -126,6 +126,44 @@ def create_app(mongo_client: Any | None = None) -> Flask:
         results = list(trips.find(query, PROJECTION).limit(limit))
         return jsonify(count=len(results), results=results)
 
+    @app.get("/api/v1/trips/aggregate/near")
+    def aggregate_trips_near():
+        try:
+            longitude = _number("longitude", -180, 180)
+            latitude = _number("latitude", -90, 90)
+            radius = _number("radius_m", 1, 100_000)
+        except ValueError as error:
+            return jsonify(error=str(error)), 400
+
+        trips.create_index([("location", "2dsphere")])
+        pipeline = [
+            {
+                "$geoNear": {
+                    "near": {
+                        "type": "Point",
+                        "coordinates": [longitude, latitude],
+                    },
+                    "key": "location",
+                    "distanceField": "distance_m",
+                    "maxDistance": radius,
+                    "spherical": True,
+                }
+            },
+            {
+                "$group": {
+                    "_id": "$call_type",
+                    "trip_count": {"$sum": 1},
+                    "average_distance_m": {"$avg": "$distance_m"},
+                    "average_trip_duration_seconds": {
+                        "$avg": "$trip_duration_seconds"
+                    },
+                }
+            },
+            {"$sort": {"trip_count": -1, "_id": 1}},
+        ]
+        results = list(trips.aggregate(pipeline))
+        return jsonify(count=len(results), results=results)
+
     @app.get("/api/v1/aggregates/within")
     def aggregates_within():
         try:
