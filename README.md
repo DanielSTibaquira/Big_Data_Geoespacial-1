@@ -91,10 +91,11 @@ La API escucha en `http://localhost:5000`. Rutas disponibles:
 GET /health
 GET /api/v1/trips/near?longitude=-8.61&latitude=41.14&radius_m=500&limit=100
 GET /api/v1/trips/within?min_lon=-8.7&min_lat=41.1&max_lon=-8.5&max_lat=41.2&limit=100
+GET /api/v1/trips/aggregate/near?longitude=-8.61&latitude=41.14&radius_m=500
 GET /api/v1/aggregates/within?min_lon=-8.7&min_lat=41.1&max_lon=-8.5&max_lat=41.2&limit=100
 ```
 
-Las rutas `within` aceptan una caja rectangular WGS84 y la convierten a un polígono GeoJSON. La búsqueda de viajes usa el índice `location_2dsphere` creado durante la ingesta; la consulta de agregados crea de forma idempotente el índice `cell_center_2dsphere`. Los parámetros inválidos devuelven HTTP 400 y los errores de MongoDB HTTP 503.
+`trips/near` implementa una búsqueda por radio con `$near`; `trips/within` implementa `$geoWithin` con un polígono GeoJSON cerrado a partir de la caja rectangular WGS84. `trips/aggregate/near` inicia su pipeline con `$geoNear`, restringe resultados al radio indicado y agrupa por tipo de llamada, devolviendo conteo y distancias/duración medias. Las rutas espaciales crean de forma idempotente los índices `location_2dsphere` o `cell_center_2dsphere`, según corresponda. Los parámetros inválidos devuelven HTTP 400 y los errores de MongoDB HTTP 503.
 
 ### Benchmark Dask/Spark
 
@@ -141,7 +142,9 @@ docker compose --profile ci up -d --build jenkins
 docker compose --profile ci logs jenkins
 ```
 
-Abre `http://localhost:8080`, termina el asistente inicial, instala los plugins **Pipeline** y **Credentials Binding**, y crea una credencial **Secret file** con ID `kaggle-json` a partir de tu archivo local de Kaggle. Crea un job **Pipeline** conectado al repositorio y selecciona `Jenkinsfile`. El job ejecuta las pruebas y descarga `crailtap/taxi-trajectory` a `data/train.csv` si aún no existe; marca `FORCE_DATASET_DOWNLOAD` para actualizarlo. El volumen `jenkins_home` conserva la configuración de Jenkins y `./data` comparte el CSV con los servicios del proyecto.
+Abre `http://localhost:8080`, termina el asistente inicial y crea una credencial **Secret file** con ID `kaggle-json` a partir de tu archivo local de Kaggle. La imagen instala los plugins de **GitHub**, **Pipeline** y **Credentials Binding**. Crea un job **Pipeline** conectado al repositorio y selecciona `Jenkinsfile`; el pipeline declara el trigger `githubPush()`. El job ejecuta las pruebas y descarga `crailtap/taxi-trajectory` a `data/train.csv` si aún no existe; marca `FORCE_DATASET_DOWNLOAD` para actualizarlo. El volumen `jenkins_home` conserva la configuración de Jenkins y `./data` comparte el CSV con los servicios del proyecto.
+
+Para que GitHub dispare el webhook, Jenkins debe tener una URL HTTPS pública alcanzable desde GitHub: la dirección local `http://localhost:8080` no es accesible desde Internet. En **Settings → Webhooks → Add webhook**, usa `<URL pública de Jenkins>/github-webhook/`, selecciona `application/json` y el evento **Just the push event**. No expongas directamente el puerto de desarrollo sin un túnel/reverse proxy HTTPS protegido. Después de guardar el webhook, verifica el evento en la pestaña **Recent Deliveries** y que Jenkins inicie el job.
 
 ### Pruebas locales
 

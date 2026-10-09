@@ -1,5 +1,7 @@
 FROM jenkins/jenkins:lts-jdk17
 
+RUN jenkins-plugin-cli --plugins github workflow-aggregator credentials-binding git
+
 USER root
 RUN apt-get update \
     && apt-get install -y --no-install-recommends python3 python3-venv \
