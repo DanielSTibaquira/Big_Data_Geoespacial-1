@@ -124,6 +124,33 @@ while time.monotonic() < deadline:
     time.sleep(2)
 else:
     raise SystemExit(f"Candidate API health check failed: {last_error}")
+
+polygon = {
+    "type": "Polygon",
+    "coordinates": [[
+        [-8.70, 41.10],
+        [-8.50, 41.10],
+        [-8.60, 41.30],
+        [-8.70, 41.10],
+    ]],
+}
+request = urllib.request.Request(
+    "http://api-ci:5000/api/v1/trips/within",
+    data=json.dumps({"polygon": polygon, "limit": 3}).encode(),
+    headers={"Content-Type": "application/json"},
+    method="POST",
+)
+try:
+    with urllib.request.urlopen(request, timeout=15) as response:
+        payload = json.load(response)
+except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as error:
+    raise SystemExit(f"Candidate GeoJSON query failed: {error}") from error
+
+results = payload.get("results") if isinstance(payload, dict) else None
+count = payload.get("count") if isinstance(payload, dict) else None
+if not isinstance(results, list) or count != len(results) or count > 3:
+    raise SystemExit(f"Unexpected GeoJSON query response: {payload!r}")
+print(f"Candidate $geoWithin POST smoke test passed ({count} results)")
 PY
                     cleanup_candidate
                     trap - EXIT
