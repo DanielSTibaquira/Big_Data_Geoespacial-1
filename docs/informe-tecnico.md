@@ -60,11 +60,11 @@ La ejecución validada produjo 6.781 grupos. La suma de `trip_count` es 1.704.75
 La API está disponible en el puerto 5000. Sus operaciones principales son:
 
 1. **Proximidad con `$near`:** `GET /api/v1/trips/near?longitude=-8.61&latitude=41.14&radius_m=500&limit=100`. Busca viajes dentro del radio en metros y devuelve primero los más cercanos.
-2. **Contención con `$geoWithin`:** `GET /api/v1/trips/within?min_lon=-8.7&min_lat=41.1&max_lon=-8.5&max_lat=41.2&limit=100`. Construye un polígono GeoJSON cerrado a partir de la caja WGS84.
+2. **Contención con `$geoWithin`:** `GET /api/v1/trips/within?min_lon=-8.7&min_lat=41.1&max_lon=-8.5&max_lat=41.2&limit=100` conserva la consulta rectangular. `POST /api/v1/trips/within` recibe un GeoJSON Polygon en el cuerpo JSON, con coordenadas 2D `[longitud, latitud]` WGS84 y anillos cerrados; ambos consultan `location` y devuelven `count` y `results`.
 3. **Agregación con `$geoNear`:** `GET /api/v1/trips/aggregate/near?longitude=-8.61&latitude=41.14&radius_m=500`. La primera etapa del pipeline calcula la distancia esférica y filtra por radio; las etapas siguientes agrupan por tipo de llamada y devuelven viajes, distancia media y duración media.
 4. **Agregados dentro de área:** `GET /api/v1/aggregates/within?...` selecciona centros de celda Spark dentro de la caja indicada.
 
-Las consultas geoespaciales aseguran la existencia del índice `2dsphere` correspondiente. Los parámetros se validan y las respuestas limitan resultados donde aplica; parámetros inválidos producen HTTP 400 y fallos MongoDB HTTP 503.
+Las consultas geoespaciales aseguran la existencia del índice `2dsphere` correspondiente. Los parámetros se validan y las respuestas limitan resultados donde aplica; el POST valida el tipo Polygon, anillos cerrados, dimensiones 2D y rangos WGS84. Entradas inválidas producen HTTP 400 y fallos MongoDB HTTP 503.
 
 ## Benchmark
 
@@ -81,9 +81,9 @@ El pico de memoria se obtiene de `memory.peak` (cgroup v2) o `memory.max_usage_i
 
 ## Automatización y pruebas
 
-`Jenkinsfile` define checkout, descarga condicional del dataset, pytest, build de la imagen API, despliegue temporal de una candidata y solicitud a `/health`. Si el smoke test responde con `{"status":"ok"}`, Jenkins actualiza el servicio `api`; en caso contrario, elimina la candidata y no despliega la versión nueva. Jenkins comparte la red y el proyecto Compose existente (`parcial` por defecto), por lo que el parámetro `COMPOSE_PROJECT_NAME` debe coincidir con el proyecto local. La imagen Jenkins incluye Docker CLI/Compose y monta `/var/run/docker.sock`; este socket concede control prácticamente administrativo al daemon y se reserva para el equipo local de desarrollo. Para recibir eventos push, se habilitó y probó el trigger `githubPush()` mediante el webhook HTTPS público `/github-webhook/`; la URL del túnel es temporal y debe mantenerse activa durante la demostración.
+`Jenkinsfile` define checkout, descarga condicional del dataset, pytest, build de la imagen API, despliegue temporal de una candidata y smoke tests de `/health` y `POST /api/v1/trips/within` con `$geoWithin` contra MongoDB. Solo si ambas solicitudes responden correctamente, Jenkins actualiza el servicio `api`; en caso contrario, elimina la candidata y no despliega la versión nueva. Jenkins comparte la red y el proyecto Compose existente (`parcial` por defecto), por lo que el parámetro `COMPOSE_PROJECT_NAME` debe coincidir con el proyecto local. La imagen Jenkins incluye Docker CLI/Compose y monta `/var/run/docker.sock`; este socket concede control prácticamente administrativo al daemon y se reserva para el equipo local de desarrollo. Para recibir eventos push, se habilitó y probó el trigger `githubPush()` mediante el webhook HTTPS público `/github-webhook/`; la URL del túnel es temporal y debe mantenerse activa durante la demostración.
 
-La suite incluye pruebas de transformación, API, construcción de consultas, agrupación y lectura de la métrica cgroup. Debe ejecutarse antes de construir y desplegar; el pipeline también valida `/health` contra una API candidata en Docker.
+La suite incluye pruebas de transformación, API, construcción de consultas, agrupación y lectura de la métrica cgroup. Debe ejecutarse antes de construir y desplegar; el pipeline valida la salud y una consulta geoespacial sobre una API candidata conectada a MongoDB en Docker.
 
 ## Limitaciones y trabajo futuro
 

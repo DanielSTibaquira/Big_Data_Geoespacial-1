@@ -91,11 +91,29 @@ La API escucha en `http://localhost:5000`. Rutas disponibles:
 GET /health
 GET /api/v1/trips/near?longitude=-8.61&latitude=41.14&radius_m=500&limit=100
 GET /api/v1/trips/within?min_lon=-8.7&min_lat=41.1&max_lon=-8.5&max_lat=41.2&limit=100
+POST /api/v1/trips/within
 GET /api/v1/trips/aggregate/near?longitude=-8.61&latitude=41.14&radius_m=500
 GET /api/v1/aggregates/within?min_lon=-8.7&min_lat=41.1&max_lon=-8.5&max_lat=41.2&limit=100
 ```
 
-`trips/near` implementa una búsqueda por radio con `$near`; `trips/within` implementa `$geoWithin` con un polígono GeoJSON cerrado a partir de la caja rectangular WGS84. `trips/aggregate/near` inicia su pipeline con `$geoNear`, restringe resultados al radio indicado y agrupa por tipo de llamada, devolviendo conteo y distancias/duración medias. Las rutas espaciales crean de forma idempotente los índices `location_2dsphere` o `cell_center_2dsphere`, según corresponda. Los parámetros inválidos devuelven HTTP 400 y los errores de MongoDB HTTP 503.
+`trips/near` implementa una búsqueda por radio con `$near`. El método GET de `trips/within` conserva la consulta rectangular existente y construye un polígono GeoJSON cerrado. El método POST de la misma ruta recibe un polígono GeoJSON Polygon arbitrario en el cuerpo, con posiciones 2D `[longitud, latitud]` WGS84 y anillos cerrados:
+
+```json
+{
+  "polygon": {
+    "type": "Polygon",
+    "coordinates": [[
+      [-8.62, 41.14],
+      [-8.60, 41.14],
+      [-8.61, 41.16],
+      [-8.62, 41.14]
+    ]]
+  },
+  "limit": 100
+}
+```
+
+Envía este cuerpo a `POST /api/v1/trips/within` con `Content-Type: application/json`. `limit` es opcional (predeterminado 100, máximo 500). GeoJSON inválido, coordenadas fuera de rango o límites inválidos producen HTTP 400. Ambos métodos consultan `location` con `$geoWithin` y devuelven `count` y `results`. `trips/aggregate/near` inicia su pipeline con `$geoNear`, restringe resultados al radio indicado y agrupa por tipo de llamada, devolviendo conteo y distancias/duración medias. Las rutas espaciales crean de forma idempotente los índices `location_2dsphere` o `cell_center_2dsphere`, según corresponda; los errores de MongoDB producen HTTP 503.
 
 ### Benchmark Dask/Spark
 
@@ -142,7 +160,7 @@ docker compose --profile ci up -d --build jenkins
 docker compose --profile ci logs jenkins
 ```
 
-Abre `http://localhost:8080`, termina el asistente inicial y crea una credencial **Secret file** con ID `kaggle-json` a partir de tu archivo local de Kaggle. La imagen instala Docker CLI/Compose y los plugins de **GitHub**, **Pipeline** y **Credentials Binding**. Crea un job **Pipeline** conectado al repositorio y selecciona `Jenkinsfile`; el pipeline declara el trigger `githubPush()`. El job descarga `crailtap/taxi-trajectory` a `data/train.csv` si aún no existe, ejecuta pytest, construye la imagen de API, levanta una API candidata y MongoDB, y consulta `http://api-ci:5000/health` desde Jenkins. Solo si la candidata responde correctamente, actualiza el servicio `api`; marca `FORCE_DATASET_DOWNLOAD` para forzar la descarga. El parámetro `COMPOSE_PROJECT_NAME` debe coincidir con el proyecto donde corre Jenkins (en este entorno: `parcial`).
+Abre `http://localhost:8080`, termina el asistente inicial y crea una credencial **Secret file** con ID `kaggle-json` a partir de tu archivo local de Kaggle. La imagen instala Docker CLI/Compose y los plugins de **GitHub**, **Pipeline** y **Credentials Binding**. Crea un job **Pipeline** conectado al repositorio y selecciona `Jenkinsfile`; el pipeline declara el trigger `githubPush()`. El job descarga `crailtap/taxi-trajectory` a `data/train.csv` si aún no existe, ejecuta pytest, construye la imagen de API, levanta una API candidata y MongoDB, comprueba `/health` y ejecuta un POST GeoJSON a `/api/v1/trips/within` desde Jenkins contra MongoDB. Solo si ambos smoke tests responden correctamente, actualiza el servicio `api`; marca `FORCE_DATASET_DOWNLOAD` para forzar la descarga. El parámetro `COMPOSE_PROJECT_NAME` debe coincidir con el proyecto donde corre Jenkins (en este entorno: `parcial`).
 
 Jenkins monta `/var/run/docker.sock` para ejecutar el despliegue en el Docker del equipo. **Ese socket otorga a los jobs control prácticamente administrativo sobre Docker y los contenedores del host**; úsalo solo en este entorno local y no ejecutes cambios de repositorios o ramas no confiables. En Linux, si Jenkins no puede acceder al socket, define `DOCKER_GID` con el grupo propietario del socket antes de recrear el servicio. El volumen `jenkins_home` conserva la configuración y `./data` comparte el CSV con los servicios del proyecto.
 

@@ -2,12 +2,32 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
+import pytest
+
 from api.app import create_app
+
+VALID_POLYGON = {
+    "type": "Polygon",
+    "coordinates": [
+        [
+            [-8.62, 41.14],
+            [-8.60, 41.14],
+            [-8.61, 41.16],
+            [-8.62, 41.14],
+        ]
+    ],
+}
 
 
 class FakeCursor(list):
+    def __init__(self, documents):
+        super().__init__(documents)
+        self.limit_count = None
+
     def limit(self, count):
-        return FakeCursor(self[:count])
+        self.limit_count = count
+        del self[count:]
+        return self
 
 
 class FakeCollection:
@@ -17,11 +37,13 @@ class FakeCollection:
         self.pipeline = None
         self.projection = None
         self.indexes = []
+        self.cursor = None
 
     def find(self, query, projection=None):
         self.query = query
         self.projection = projection
-        return FakeCursor(self.documents)
+        self.cursor = FakeCursor(self.documents)
+        return self.cursor
 
     def create_index(self, keys):
         self.indexes.append(keys)
@@ -116,6 +138,111 @@ def test_within_endpoint_uses_a_closed_geojson_bounding_polygon():
     assert geometry["type"] == "Polygon"
     assert geometry["coordinates"][0][0] == [-8.7, 41.1]
     assert geometry["coordinates"][0][-1] == [-8.7, 41.1]
+
+
+def test_within_post_accepts_geojson_polygon_and_applies_limit():
+    client, mongo = create_test_client()
+
+    response = client.post(
+        "/api/v1/trips/within",
+        json={"polygon": VALID_POLYGON, "limit": 1},
+    )
+
+    trips = mongo.database.collections["trips"]
+    assert response.status_code == 200
+    assert response.json["count"] == 1
+    assert len(response.json["results"]) == 1
+    assert trips.query == {
+        "location": {"$geoWithin": {"$geometry": VALID_POLYGON}}
+    }
+    assert trips.cursor.limit_count == 1
+
+
+def test_within_post_defaults_limit_to_100():
+    client, mongo = create_test_client()
+
+    response = client.post(
+        "/api/v1/trips/within",
+        json={"polygon": VALID_POLYGON},
+    )
+
+    assert response.status_code == 200
+    assert mongo.database.collections["trips"].cursor.limit_count == 100
+
+
+@pytest.mark.parametrize(
+    "polygon",
+    [
+        None,
+        {"type": "Point", "coordinates": [-8.61, 41.14]},
+        {"type": "Polygon", "coordinates": []},
+        {"type": "Polygon", "coordinates": [[[-8.62, 41.14], [-8.60, 41.14]]]},
+        {
+            "type": "Polygon",
+            "coordinates": [[[-8.62, 41.14], [-8.60, 41.14], [-8.61, 41.16]]],
+        },
+        {
+            "type": "Polygon",
+            "coordinates": [
+                [[-181, 41.14], [-8.60, 41.14], [-8.61, 41.16], [-181, 41.14]]
+            ],
+        },
+        {
+            "type": "Polygon",
+            "coordinates": [
+                [[-8.62, 91], [-8.60, 41.14], [-8.61, 41.16], [-8.62, 91]]
+            ],
+        },
+        {
+            "type": "Polygon",
+            "coordinates": [
+                [
+                    [-8.62, 41.14, 0],
+                    [-8.60, 41.14, 0],
+                    [-8.61, 41.16, 0],
+                    [-8.62, 41.14, 0],
+                ]
+            ],
+        },
+    ],
+)
+def test_within_post_rejects_invalid_polygons(polygon):
+    client, mongo = create_test_client()
+
+    response = client.post(
+        "/api/v1/trips/within",
+        json={"polygon": polygon},
+    )
+
+    assert response.status_code == 400
+    assert mongo.database.collections["trips"].query is None
+
+
+@pytest.mark.parametrize("limit", [0, 501, 1.5, "2", True, None])
+def test_within_post_rejects_invalid_limits(limit):
+    client, mongo = create_test_client()
+
+    response = client.post(
+        "/api/v1/trips/within",
+        json={"polygon": VALID_POLYGON, "limit": limit},
+    )
+
+    assert response.status_code == 400
+    assert mongo.database.collections["trips"].query is None
+
+
+def test_within_post_rejects_malformed_json():
+    client, mongo = create_test_client()
+
+    response = client.post(
+        "/api/v1/trips/within",
+        data="{",
+        content_type="application/json",
+    )
+
+    assert response.status_code == 400
+    assert mongo.database.collections["trips"].query is None
+
 
 def test_near_aggregation_uses_geonear_then_groups_by_call_type():
     client, mongo = create_test_client()

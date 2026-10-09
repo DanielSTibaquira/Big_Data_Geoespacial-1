@@ -38,7 +38,12 @@ def _number(name: str, minimum: float, maximum: float) -> float:
 
 
 def _limit() -> int:
-    value = request.args.get("limit", "100")
+    return _parse_limit(request.args.get("limit", "100"))
+
+
+def _parse_limit(value: Any) -> int:
+    if isinstance(value, bool) or not isinstance(value, (int, str)):
+        raise ValueError("Parameter limit must be an integer")
     try:
         limit = int(value)
     except ValueError as exc:
@@ -46,6 +51,54 @@ def _limit() -> int:
     if not 1 <= limit <= RESULT_LIMIT:
         raise ValueError(f"Parameter limit must be between 1 and {RESULT_LIMIT}")
     return limit
+
+
+def _geojson_polygon(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict) or value.get("type") != "Polygon":
+        raise ValueError("polygon must be a GeoJSON Polygon")
+
+    coordinates = value.get("coordinates")
+    if not isinstance(coordinates, list) or not coordinates:
+        raise ValueError("Polygon coordinates must contain at least one ring")
+
+    for ring_index, ring in enumerate(coordinates):
+        if not isinstance(ring, list) or len(ring) < 4:
+            raise ValueError(
+                f"Polygon ring {ring_index} must contain at least four positions"
+            )
+
+        for position in ring:
+            if not isinstance(position, list) or len(position) != 2:
+                raise ValueError(
+                    "Polygon positions must contain longitude and latitude only"
+                )
+            longitude, latitude = position
+            if (
+                isinstance(longitude, bool)
+                or isinstance(latitude, bool)
+                or not isinstance(longitude, (int, float))
+                or not isinstance(latitude, (int, float))
+            ):
+                raise ValueError("Polygon coordinates must be numeric")
+            if (
+                (isinstance(longitude, float) and not math.isfinite(longitude))
+                or (isinstance(latitude, float) and not math.isfinite(latitude))
+                or not -180 <= longitude <= 180
+                or not -90 <= latitude <= 90
+            ):
+                raise ValueError(
+                    "Polygon coordinates must be within WGS84 longitude "
+                    "and latitude ranges"
+                )
+
+        if ring[0] != ring[-1]:
+            raise ValueError(f"Polygon ring {ring_index} must be closed")
+        if len({tuple(position) for position in ring[:-1]}) < 3:
+            raise ValueError(
+                f"Polygon ring {ring_index} must contain at least three distinct positions"
+            )
+
+    return {"type": "Polygon", "coordinates": coordinates}
 
 
 def _bounding_polygon() -> dict[str, Any]:
@@ -119,6 +172,24 @@ def create_app(mongo_client: Any | None = None) -> Flask:
         try:
             polygon = _bounding_polygon()
             limit = _limit()
+        except ValueError as error:
+            return jsonify(error=str(error)), 400
+
+        query = {"location": {"$geoWithin": {"$geometry": polygon}}}
+        results = list(trips.find(query, PROJECTION).limit(limit))
+        return jsonify(count=len(results), results=results)
+
+    @app.post("/api/v1/trips/within")
+    def trips_within_polygon():
+        body = request.get_json(silent=True)
+        if not isinstance(body, dict):
+            return jsonify(error="Request body must be a JSON object"), 400
+        try:
+            polygon = _geojson_polygon(body.get("polygon"))
+            limit_value = body.get("limit", 100)
+            if isinstance(limit_value, bool) or not isinstance(limit_value, int):
+                raise ValueError("Parameter limit must be an integer")
+            limit = _parse_limit(limit_value)
         except ValueError as error:
             return jsonify(error=str(error)), 400
 
