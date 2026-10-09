@@ -124,7 +124,7 @@ while time.monotonic() < deadline:
     time.sleep(2)
 else:
     raise SystemExit(f"Candidate API health check failed: {last_error}")
-                    PY
+PY
                     cleanup_candidate
                     trap - EXIT
                 '''
