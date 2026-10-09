@@ -10,6 +10,8 @@ from pyspark.sql import SparkSession
 from pyspark.sql import functions as F
 from pyspark.sql.types import ArrayType, DoubleType
 
+from benchmark.memory import peak_memory_bytes
+
 CELL_SIZE_DEGREES = 0.01
 
 
@@ -19,6 +21,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--csv", default="/data/train.csv")
     parser.add_argument("--output", default="/results/spark.json")
+    parser.add_argument("--master", default="local[*]")
     return parser.parse_args()
 
 
@@ -28,7 +31,8 @@ def main() -> None:
         raise FileNotFoundError(f"Input CSV does not exist: {args.csv}")
 
     spark = (
-        SparkSession.builder.appName("TaxiAggregationBenchmark")
+        SparkSession.builder.master(args.master)
+        .appName("TaxiAggregationBenchmark")
         .config("spark.sql.session.timeZone", "UTC")
         .getOrCreate()
     )
@@ -78,10 +82,14 @@ def main() -> None:
         )
         rows = aggregates.collect()
         elapsed = time.perf_counter() - started
+        memory_peak = peak_memory_bytes()
         result: dict[str, Any] = {
             "engine": "spark",
             "parallelism": spark.sparkContext.defaultParallelism,
             "elapsed_seconds": round(elapsed, 6),
+            "peak_memory_bytes": memory_peak,
+            "peak_memory_mib": round(memory_peak / (1024**2), 2),
+            "memory_measurement": "container cgroup peak since container start",
             "valid_trip_count": sum(row["trip_count"] for row in rows),
             "aggregate_group_count": len(rows),
             "input_file": Path(args.csv).name,

@@ -4,7 +4,11 @@ RUN jenkins-plugin-cli --plugins github workflow-aggregator credentials-binding 
 
 USER root
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends python3 python3-venv \
+    && apt-get install -y --no-install-recommends \
+        docker-cli \
+        docker-compose \
+        python3 \
+        python3-venv \
     && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt /tmp/jenkins-requirements.txt

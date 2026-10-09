@@ -16,6 +16,11 @@ pipeline {
             defaultValue: false,
             description: 'Download the Kaggle dataset again even when /data/train.csv exists.'
         )
+        string(
+            name: 'COMPOSE_PROJECT_NAME',
+            defaultValue: 'parcial',
+            description: 'Existing Compose project that Jenkins will update.'
+        )
     }
 
     environment {
@@ -65,6 +70,75 @@ pipeline {
                         -r api/requirements.txt \
                         -r requirements-dev.txt
                     .venv/bin/python -m pytest -q
+                '''
+            }
+        }
+
+        stage('Build API image') {
+            steps {
+                sh '''
+                    set -eu
+                    docker-compose \
+                        --project-name "$COMPOSE_PROJECT_NAME" \
+                        --file "$WORKSPACE/docker-compose.yml" \
+                        build api
+                '''
+            }
+        }
+
+        stage('Candidate deployment and API smoke test') {
+            steps {
+                sh '''
+                    set -eu
+                    compose() {
+                        docker-compose \
+                            --project-name "$COMPOSE_PROJECT_NAME" \
+                            --file "$WORKSPACE/docker-compose.yml" \
+                            "$@"
+                    }
+                    cleanup_candidate() {
+                        compose --profile ci-deploy rm --force --stop api-ci
+                    }
+                    trap cleanup_candidate EXIT
+                    compose --profile ci-deploy up --detach mongodb api-ci
+                    python3 - <<'PY'
+import json
+import time
+import urllib.error
+import urllib.request
+
+deadline = time.monotonic() + 60
+last_error = "No response from the candidate API"
+while time.monotonic() < deadline:
+    try:
+        with urllib.request.urlopen(
+            "http://api-ci:5000/health", timeout=3
+        ) as response:
+            payload = json.load(response)
+        if payload.get("status") == "ok":
+            print("Candidate API health check passed")
+            break
+        last_error = f"Unexpected health response: {payload!r}"
+    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as error:
+        last_error = str(error)
+    time.sleep(2)
+else:
+    raise SystemExit(f"Candidate API health check failed: {last_error}")
+                    PY
+                    cleanup_candidate
+                    trap - EXIT
+                '''
+            }
+        }
+
+        stage('Deploy API') {
+            steps {
+                sh '''
+                    set -eu
+                    docker-compose \
+                        --project-name "$COMPOSE_PROJECT_NAME" \
+                        --file "$WORKSPACE/docker-compose.yml" \
+                        up --detach --no-deps api
                 '''
             }
         }
