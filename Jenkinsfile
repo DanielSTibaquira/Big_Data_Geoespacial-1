@@ -35,7 +35,7 @@ pipeline {
                 withCredentials([file(credentialsId: 'kaggle-json', variable: 'KAGGLE_JSON')]) {
                     sh '''
                         set -eu
-                        if [ "$FORCE_DATASET_DOWNLOAD" = "true" ] || [ ! -s /data/train.csv ]; then
+                        if [ "${FORCE_DATASET_DOWNLOAD:-false}" = "true" ] || [ ! -s /data/train.csv ]; then
                             config_dir="$(mktemp -d)"
                             trap 'rm -rf "$config_dir"' EXIT
                             mkdir -p /data
