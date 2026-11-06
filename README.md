@@ -1,4 +1,7 @@
 # LifeMap: reputación, ubicación y supervivencia de negocios
+**Integrantes:**
+- Daniel Santiago Tibaquira León (`DanielSTibaquira`)
+- Dally Doriana Bermúdez Gallego (`Lilith0B06`)
 
 Proyecto académico de Big Data para analizar reputación, ubicación y supervivencia de restaurantes en el área de Philadelphia usando Yelp Open Dataset. Se reutilizan componentes del trabajo geoespacial de taxis, que se conserva como flujo previo y no como dataset de la entrega final.
 
@@ -9,7 +12,10 @@ Proyecto académico de Big Data para analizar reputación, ubicación y superviv
 - **Familia:** `Restaurants`, detectada como categoría completa y no como coincidencia parcial.
 - **Ingesta nueva:** `ingestion/yelp_dataset.py` descarga/inspecciona la fuente; `ingestion/yelp_ingest.py` filtra, limpia, etiqueta reseñas y carga negocios y reseñas en MongoDB.
 - **Persistencia:** base `lifemap`, colecciones `businesses` y `reviews`; cada negocio contiene un punto GeoJSON y la aproximación de vida/evento/censura calculada desde sus reseñas.
-- **Estado:** ingesta completa ejecutada (16.407 negocios y 1.296.634 reseñas); Spark MLlib, tasas MapReduce y benchmark ejecutados localmente. API y `/predict` probados con el modelo generado. El despliegue público sigue pendiente de un servidor/URL autorizado.
+- **Estado:** ingesta completa ejecutada (16.407 negocios y 1.296.634 reseñas); Spark MLlib, tasas MapReduce y benchmark ejecutados localmente. API y `/predict` probados con el modelo generado. 
+Despliegue público operativo mediante túnel seguro:
+- **URL Base:** [https://job-undrafted-banish.ngrok-free.dev/](https://job-undrafted-banish.ngrok-free.dev/)
+- **Healthcheck:** [https://job-undrafted-banish.ngrok-free.dev/health](https://job-undrafted-banish.ngrok-free.dev/health)
 
 El área es una delimitación operacional reproducible del equipo, no la frontera administrativa oficial de la MSA. El README mantiene también las instrucciones del dataset de taxis para reproducir los experimentos anteriores.
 
