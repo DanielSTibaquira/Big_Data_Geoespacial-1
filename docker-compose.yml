@@ -125,7 +125,7 @@ services:
       DASK_SCHEDULER_HOST: dask-scheduler
       GIT_COMMIT: ${GIT_COMMIT:-unknown}
     ports:
-      - "127.0.0.1:5000:5000"
+      - "5000:5000"
     volumes:
       - ./data/lifemap:/lifemap:ro
     depends_on:
