@@ -5,6 +5,7 @@ WORKDIR /app
 COPY requirements.txt .
 RUN python -m pip install --no-cache-dir -r requirements.txt
 
-COPY ingest.py .
+COPY . /app/ingestion
+ENV PYTHONPATH=/app
 
-ENTRYPOINT ["python", "ingest.py"]
+ENTRYPOINT ["python", "-m", "ingestion.ingest"]

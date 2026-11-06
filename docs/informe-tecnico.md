@@ -35,7 +35,7 @@ flowchart LR
     Spark --> Bench
 ```
 
-MongoDB, Dask, Spark y Flask se ejecutan mediante Docker Compose. Jenkins se activa con el perfil `ci`; los benchmarks se ejecutan como jobs bajo el perfil `benchmark` o mediante `spark-submit`.
+MongoDB, Dask, Spark y Flask se ejecutan mediante Docker Compose. La API Flask sirve además una interfaz web Leaflet en el mismo origen para consultar viajes por radio, dibujar polígonos y visualizar agregados Spark. Jenkins se activa con el perfil `ci`; los benchmarks se ejecutan como jobs bajo el perfil `benchmark` o mediante `spark-submit`.
 
 ## Ingesta y modelo geoespacial
 
@@ -57,7 +57,7 @@ La ejecución validada produjo 6.781 grupos. La suma de `trip_count` es 1.704.75
 
 ## Consultas geoespaciales
 
-La API está disponible en el puerto 5000. Sus operaciones principales son:
+La API y el mapa interactivo Leaflet están disponibles en el puerto 5000. El mapa permite buscar viajes próximos, dibujar un polígono y representar agregados. Sus operaciones principales son:
 
 1. **Proximidad con `$near`:** `GET /api/v1/trips/near?longitude=-8.61&latitude=41.14&radius_m=500&limit=100`. Busca viajes dentro del radio en metros y devuelve primero los más cercanos.
 2. **Contención con `$geoWithin`:** `GET /api/v1/trips/within?min_lon=-8.7&min_lat=41.1&max_lon=-8.5&max_lat=41.2&limit=100` conserva la consulta rectangular. `POST /api/v1/trips/within` recibe un GeoJSON Polygon en el cuerpo JSON, con coordenadas 2D `[longitud, latitud]` WGS84 y anillos cerrados; ambos consultan `location` y devuelven `count` y `results`.
@@ -95,3 +95,41 @@ La suite incluye pruebas de transformación, API, construcción de consultas, ag
 ## Reproducción
 
 Los comandos para Compose, ingesta, agregación, API y benchmark están en el [README principal](../README.md). Ejecutar `python -m pytest -q` para verificar las pruebas. Los datos locales se descargan aparte y las credenciales se configuran fuera del repositorio.
+
+## Resultados de la adaptación LifeMap con Yelp
+
+Se mantuvo el flujo de taxis en `taxi_geospatial` y se creó el flujo LifeMap, sin fusionar fuentes, en `lifemap`. La muestra final contiene 16.407 restaurantes de PA, NJ y DE en un radio de 50 km de Philadelphia City Hall, y 1.296.634 reseñas válidas. La delimitación es operacional, no una frontera oficial de la MSA. La ingesta completa leyó 6.990.280 reseñas; 5.693.646 correspondieron a negocios fuera del área.
+
+### Sentimiento
+
+Las clases se definieron como 1–2 estrellas negativas, 3 neutrales y 4–5 positivas. El conjunto contiene 275.704 negativas, 163.388 neutrales y 857.542 positivas. Se separó entrenamiento y prueba de forma determinista por negocio: 1.021.718 y 274.916 reseñas, respectivamente, con cero negocios compartidos.
+
+| Modelo | Accuracy | F1 ponderado | Recall negativa | Recall neutral | Recall positiva |
+|---|---:|---:|---:|---:|---:|
+| Naive Bayes | 0,772 | 0,790 | 0,723 | 0,584 | 0,823 |
+| Regresión logística | 0,847 | 0,831 | 0,820 | 0,289 | 0,961 |
+
+Regresión logística queda como modelo de serving por su mejor accuracy y F1 ponderado; su bajo recall neutral y el desbalance (66 % positivas) limitan su interpretación. El endpoint `/predict` usa el modelo exportado sin cargar Spark en la API.
+
+### Supervivencia aproximada y tasas
+
+La duración se estima entre la primera y la última reseña; `is_open` determina evento/censura, por lo que no equivale a fechas reales de apertura y cierre. Se aplicó `cierres / días-negocio × 365 × 100` con exposición mínima de 365 días-negocio. RDD `reduceByKey` y agrupación DataFrame coincidieron en 647 grupos; se persistieron 644 que superaron el umbral en `lifemap.closure_rates`.
+
+### Balanceo
+
+Tiempos medios en segundos de tres repeticiones por configuración sobre los 16.407 negocios, en el entorno local de un worker Spark con un core:
+
+| Particiones | Sin clave | Por ciudad |
+|---:|---:|---:|
+| 2 | 0,427 | 0,203 |
+| 8 | 0,644 | 0,347 |
+| 32 | 0,985 | 0,535 |
+| 200 | 4,234 | 2,382 |
+
+En esta ejecución por ciudad fue más rápido; estos tiempos describen el entorno local y no se extrapolan a otro clúster.
+
+### Verificación y límites
+
+La suite local pasó 52 pruebas. En el stack Compose, `/health` reportó API, MongoDB, Dask y Spark disponibles; se comprobaron consultas cercanas, resumen de zona, tasas de cierre y predicción con el modelo generado. La ingesta y los artefactos analíticos permanecen en almacenamiento local excluido de Git.
+
+No se declara un despliegue público verificado: hace falta una URL/servidor autorizado y configurar el despliegue externo. La salud local muestra `commit: unknown` cuando no se proporciona `GIT_COMMIT`. Estas métricas son de esta ejecución reproducible y no sustituyen esa evidencia de despliegue.

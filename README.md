@@ -1,6 +1,17 @@
-# Procesamiento geoespacial de trayectorias de taxis
+# LifeMap: reputación, ubicación y supervivencia de negocios
 
-Proyecto académico de Big Data para analizar trayectorias de taxis de Porto. La solución se construirá con Dask, MongoDB, Spark, Flask, Docker Compose y Jenkins.
+Proyecto académico de Big Data para analizar reputación, ubicación y supervivencia de restaurantes en el área de Philadelphia usando Yelp Open Dataset. Se reutilizan componentes del trabajo geoespacial de taxis, que se conserva como flujo previo y no como dataset de la entrega final.
+
+## Alcance de la entrega final
+
+- **Fuente:** [Yelp Open Dataset en Kaggle](https://www.kaggle.com/datasets/yelp-dataset/yelp-dataset), con `business.json` y `review.json` en formato JSON Lines.
+- **Área:** negocios de PA, NJ o DE a no más de 50 km de Philadelphia City Hall (39.9526, -75.1636).
+- **Familia:** `Restaurants`, detectada como categoría completa y no como coincidencia parcial.
+- **Ingesta nueva:** `ingestion/yelp_dataset.py` descarga/inspecciona la fuente; `ingestion/yelp_ingest.py` filtra, limpia, etiqueta reseñas y carga negocios y reseñas en MongoDB.
+- **Persistencia:** base `lifemap`, colecciones `businesses` y `reviews`; cada negocio contiene un punto GeoJSON y la aproximación de vida/evento/censura calculada desde sus reseñas.
+- **Estado:** ingesta completa ejecutada (16.407 negocios y 1.296.634 reseñas); Spark MLlib, tasas MapReduce y benchmark ejecutados localmente. API y `/predict` probados con el modelo generado. El despliegue público sigue pendiente de un servidor/URL autorizado.
+
+El área es una delimitación operacional reproducible del equipo, no la frontera administrativa oficial de la MSA. El README mantiene también las instrucciones del dataset de taxis para reproducir los experimentos anteriores.
 
 ## Estado
 
@@ -8,7 +19,71 @@ La infraestructura local está definida en `docker-compose.yml`: MongoDB, Dask, 
 
 ## Dataset
 
-El archivo original es [Taxi Trajectory Data](https://www.kaggle.com/datasets/crailtap/taxi-trajectory), de aproximadamente 1,94 GB. Jenkins lo descarga automáticamente cuando `/data/train.csv` no existe; los CSV y ZIP están excluidos de Git. Las credenciales de Kaggle se administran en Jenkins y nunca deben agregarse al repositorio.
+El trabajo previo usó [Taxi Trajectory Data](https://www.kaggle.com/datasets/crailtap/taxi-trajectory), de aproximadamente 1,94 GB. Ese flujo se conserva para reproducir el análisis anterior; no sustituye la fuente Yelp de LifeMap.
+
+## Ingesta Yelp con Dask
+
+Requiere Docker Compose v2 y una conexión a Internet la primera vez que se descarga el dataset. Los datos se guardan bajo `data/` (excluida de Git) y las credenciales de Kaggle se configuran fuera del repositorio.
+
+Primero inicia MongoDB y el clúster Dask:
+
+```powershell
+docker compose up -d mongodb dask-scheduler dask-worker-1 dask-worker-2
+```
+
+Para inspeccionar esquemas y probar la selección sin MongoDB:
+
+```powershell
+python -m pip install -r ingestion/requirements.txt
+python -m ingestion.yelp_dataset --rows 2
+```
+
+La ingesta real descarga Yelp con KaggleHub si no está en caché, conserva el dataset fuera de Git y procesa las reseñas por particiones:
+
+```powershell
+docker compose --profile jobs run --build --rm yelp-ingest --limit 10000 --report /data/yelp_smoke_report.json
+```
+
+`--limit` restringe las primeras filas fuente de reseñas para una prueba funcional; no representa la muestra mínima para el análisis final. Para la ejecución completa, omite `--limit`:
+
+```powershell
+docker compose --profile jobs run --build --rm yelp-ingest --report /data/yelp_ingestion_report.json
+```
+
+El proceso crea índices `2dsphere` para `businesses.location` y un índice por `reviews.business_id`. Los documentos de reseña guardan estrellas, etiqueta derivada (1–2 negativa, 3 neutral, 4–5 positiva), texto, fecha y referencia al negocio. Los documentos de negocio incluyen GeoJSON, categorías y `life` (primera/última reseña, días-negocio, evento y censura). La carga es idempotente por `business_id`/`review_id`; usa `--replace-collections` solo cuando quieras borrar y reconstruir ambas colecciones.
+
+El reporte JSON registra cantidades de negocios que superan cada filtro geográfico y los conteos de reseñas leídas, fuera del área, sin texto, con estrellas/fecha inválidas, duplicadas y aceptadas. La vida inferida entre reseñas es una aproximación y no la fecha real de apertura o cierre.
+
+## Sentimiento, tasas y balanceo con Spark
+
+Después de cargar el dataset completo, ejecuta el job Spark conectado al mismo MongoDB. El umbral de 365 días-negocio equivale a un año de exposición agregado y evita publicar tasas basadas en exposición insignificante:
+
+```powershell
+docker compose up -d spark-master spark-worker
+docker compose exec spark-master sh -c 'mkdir -p /tmp/spark-ivy/cache && /opt/spark/bin/spark-submit --master spark://spark-master:7077 --executor-memory 1536m --conf spark.executor.cores=1 --packages org.mongodb.spark:mongo-spark-connector_2.12:10.7.0 --conf spark.jars.ivy=/tmp/spark-ivy --conf spark.mongodb.read.connection.uri=mongodb://mongodb:27017 --conf spark.mongodb.write.connection.uri=mongodb://mongodb:27017 /opt/spark-apps/jobs/lifemap_batch.py --minimum-days-business 365 --report /lifemap/batch_report.json'
+```
+
+El job separa entrenamiento y prueba por `business_id` (80/20 determinista), entrena Naive Bayes y regresión logística sobre tokenización, stopwords inglesas, CountVectorizer e IDF, y guarda métricas por clase, matrices de confusión y modelos. También exporta `data/lifemap/model_serving.json` para `/predict`. El MapReduce emite y suma cierres/días-negocio con `reduceByKey` por categoría principal y geohash; valida ambos resultados contra un `groupBy` DataFrame antes de guardar `lifemap.closure_rates`. Por defecto mide 2, 8, 32 y 200 particiones, tres repeticiones por configuración y filas por partición al repartir sin clave y por ciudad. Los resultados quedan en `data/lifemap/batch_report.json`.
+
+Compose construye `lifemap-spark:3.5.7` con NumPy 1.24.4, requerido por MLlib; el worker anuncia 2 GB y el comando reserva 1536 MB para el executor.
+
+## API LifeMap
+
+La página principal (`http://localhost:5000/`) ofrece un mapa Leaflet de restaurantes de Philadelphia, búsqueda por radio/categoría, resumen de tasas y sentimiento de la zona, y una prueba interactiva del modelo `/predict`. Haz clic en el mapa para mover el centro y luego pulsa **Buscar en el mapa**. El explorador de taxis anterior sigue disponible en `http://localhost:5000/taxi`. Leaflet, las fuentes y las teselas de OpenStreetMap se cargan desde servicios externos, por lo que la interfaz cartográfica requiere Internet.
+
+La API conserva las rutas `/api/v1/trips/*` del trabajo geoespacial anterior y agrega las consultas de Yelp:
+
+```text
+GET  /businesses/near?lon=-75.16&lat=39.95&radius_m=1000&category=Italian
+GET  /businesses/within?min_lon=-75.3&min_lat=39.8&max_lon=-75.0&max_lat=40.1
+POST /businesses/within  {"polygon":{"type":"Polygon","coordinates":[...]}, "limit":100}
+GET  /zones/summary?lon=-75.16&lat=39.95&radius_m=1000&min_days_business=365
+GET  /stats/closure?category=Italian&min_days_business=365
+GET  /stats/closure?geohash=dr4e3&min_days_business=365
+POST /predict  {"text":"The service was wonderful"}
+```
+
+La API usa `$near`, `$geoWithin` y `$geoNear`, valida coordenadas, radios, GeoJSON y límites, y devuelve HTTP 503 para predicción hasta que exista el artefacto del modelo.
 
 ## Carpetas
 
@@ -85,6 +160,10 @@ db.trip_aggregates.aggregate([
 
 ### API Flask
 
+La interfaz web interactiva de Leaflet está disponible en `http://localhost:5000` y la API en el mismo origen. Desde el mapa puedes buscar viajes en un radio alrededor de un punto, dibujar un polígono y consultar viajes con `$geoWithin`, o visualizar las celdas de agregados Spark dentro del área visible. La página consulta `/health` para indicar el estado de la API/MongoDB.
+
+El mapa base usa teselas de OpenStreetMap y Leaflet se sirve desde un CDN; para ver el mapa y sus teselas se requiere conexión a Internet. Las consultas y datos pasan por la API Flask local.
+
 La API escucha en `http://localhost:5000`. Rutas disponibles:
 
 ```text
@@ -160,9 +239,9 @@ docker compose --profile ci up -d --build jenkins
 docker compose --profile ci logs jenkins
 ```
 
-Abre `http://localhost:8080`, termina el asistente inicial y crea una credencial **Secret file** con ID `kaggle-json` a partir de tu archivo local de Kaggle. La imagen instala Docker CLI/Compose y los plugins de **GitHub**, **Pipeline** y **Credentials Binding**. Crea un job **Pipeline** conectado al repositorio y selecciona `Jenkinsfile`; el pipeline declara el trigger `githubPush()`. El job descarga `crailtap/taxi-trajectory` a `data/train.csv` si aún no existe, ejecuta pytest, construye la imagen de API, levanta una API candidata y MongoDB, comprueba `/health` y ejecuta un POST GeoJSON a `/api/v1/trips/within` desde Jenkins contra MongoDB. Solo si ambos smoke tests responden correctamente, actualiza el servicio `api`; marca `FORCE_DATASET_DOWNLOAD` para forzar la descarga. El parámetro `COMPOSE_PROJECT_NAME` debe coincidir con el proyecto donde corre Jenkins (en este entorno: `parcial`).
+Abre `http://localhost:8080`, termina el asistente inicial y crea una credencial **Secret file** con ID `kaggle-json` a partir de tu archivo local de Kaggle. La imagen instala Docker CLI/Compose y los plugins de **GitHub**, **Pipeline** y **Credentials Binding**. Crea un job **Pipeline** conectado al repositorio y selecciona `Jenkinsfile`; el pipeline declara el trigger `githubPush()`. Cada build ejecuta pytest y prueba una API candidata, incluyendo rutas Yelp. Solo `main` descarga/ingesta Yelp completa con KaggleHub, ejecuta Spark para sentimiento/MapReduce/balanceo y despliega la API; el caché, los modelos y reportes quedan bajo `data/`, no versionados. La credencial se copia a un directorio temporal con permisos restringidos y se elimina al terminar. El flujo de taxis se conserva como legado y su smoke test continúa en el pipeline. El parámetro `COMPOSE_PROJECT_NAME` debe coincidir con el proyecto donde corre Jenkins (en este entorno: `parcial`).
 
-Jenkins monta `/var/run/docker.sock` para ejecutar el despliegue en el Docker del equipo. **Ese socket otorga a los jobs control prácticamente administrativo sobre Docker y los contenedores del host**; úsalo solo en este entorno local y no ejecutes cambios de repositorios o ramas no confiables. En Linux, si Jenkins no puede acceder al socket, define `DOCKER_GID` con el grupo propietario del socket antes de recrear el servicio. El volumen `jenkins_home` conserva la configuración y `./data` comparte el CSV con los servicios del proyecto.
+Jenkins monta `/var/run/docker.sock` para ejecutar el despliegue en el Docker del equipo. **Ese socket otorga a los jobs control prácticamente administrativo sobre Docker y los contenedores del host**; úsalo solo en este entorno local y no ejecutes cambios de repositorios o ramas no confiables. En Linux, si Jenkins no puede acceder al socket, define `DOCKER_GID` con el grupo propietario del socket antes de recrear el servicio. El volumen `jenkins_home` conserva la configuración y `./data` comparte datasets, caché y reportes con los servicios del proyecto.
 
 Para que GitHub dispare el webhook, Jenkins debe tener una URL HTTPS pública alcanzable desde GitHub: la dirección local `http://localhost:8080` no es accesible desde Internet. En **Settings → Webhooks → Add webhook**, usa `<URL pública de Jenkins>/github-webhook/`, selecciona `application/json` y el evento **Just the push event**. No expongas directamente el puerto de desarrollo sin un túnel/reverse proxy HTTPS protegido. Después de guardar el webhook, verifica el evento en la pestaña **Recent Deliveries** y que Jenkins inicie el job.
 
