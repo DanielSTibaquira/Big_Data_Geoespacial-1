@@ -1,0 +1,165 @@
+<!doctype html>
+<html lang="es">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="theme-color" content="#0b1220">
+    <title>Taxi Geo Explorer | Porto</title>
+    <link rel="preconnect" href="https://unpkg.com">
+    <link rel="preconnect" href="https://tile.openstreetmap.org">
+    <link
+      rel="stylesheet"
+      href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
+      integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY="
+      crossorigin=""
+    >
+    <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}">
+  </head>
+  <body>
+    <main class="app-shell">
+      <aside class="sidebar">
+        <header class="brand">
+          <div class="brand-mark" aria-hidden="true">T</div>
+          <div>
+            <p class="eyebrow">BIG DATA · GEOSPATIAL</p>
+            <h1>Taxi Geo Explorer</h1>
+          </div>
+        </header>
+
+        <section class="intro">
+          <p class="eyebrow">PORTUGAL / PORTO</p>
+          <h2>Explora los viajes<br>de la ciudad.</h2>
+          <p class="intro-copy">Consulta trayectorias y patrones espaciales almacenados en MongoDB.</p>
+        </section>
+
+        <div class="connection" id="connection">
+          <span class="connection-dot"></span>
+          <span id="connection-text">Comprobando conexión...</span>
+        </div>
+
+        <nav class="mode-switch" aria-label="Tipo de consulta">
+          <button class="mode-button active" data-mode="near" type="button">Radio</button>
+          <button class="mode-button" data-mode="polygon" type="button">Polígono</button>
+          <button class="mode-button" data-mode="aggregates" type="button">Agregados</button>
+        </nav>
+
+        <section class="query-panel" id="near-panel">
+          <div class="panel-heading">
+            <span class="step-number">01</span>
+            <div>
+              <h3>Viajes cercanos</h3>
+              <p>Busca desde un punto y define un radio.</p>
+            </div>
+          </div>
+          <label for="longitude">Centro de búsqueda</label>
+          <div class="coordinate-row">
+            <div class="input-wrap">
+              <span>LONGITUD</span>
+              <input id="longitude" type="number" step="any" value="-8.611" min="-180" max="180">
+            </div>
+            <div class="input-wrap">
+              <span>LATITUD</span>
+              <input id="latitude" type="number" step="any" value="41.149" min="-90" max="90">
+            </div>
+          </div>
+          <button class="button button-quiet map-pick" id="pick-center" type="button">◎ Elegir centro en el mapa</button>
+          <label for="radius">Radio de búsqueda <strong id="radius-value">500 m</strong></label>
+          <input id="radius" type="range" min="100" max="5000" step="100" value="500">
+          <label for="near-limit">Máximo de resultados</label>
+          <select id="near-limit">
+            <option value="50">50 viajes</option>
+            <option value="100" selected>100 viajes</option>
+            <option value="250">250 viajes</option>
+            <option value="500">500 viajes</option>
+          </select>
+          <button class="button button-primary" id="search-near" type="button">
+            Buscar viajes <span aria-hidden="true">→</span>
+          </button>
+        </section>
+
+        <section class="query-panel hidden" id="polygon-panel">
+          <div class="panel-heading">
+            <span class="step-number">02</span>
+            <div>
+              <h3>Dentro de un área</h3>
+              <p>Dibuja un polígono para filtrar viajes.</p>
+            </div>
+          </div>
+          <div class="draw-hint">
+            <span class="hint-icon">⌖</span>
+            <p>Inicia el dibujo y marca al menos 3 puntos en el mapa. Cierra el polígono para consultar.</p>
+          </div>
+          <label for="polygon-limit">Máximo de resultados</label>
+          <select id="polygon-limit">
+            <option value="50">50 viajes</option>
+            <option value="100" selected>100 viajes</option>
+            <option value="250">250 viajes</option>
+            <option value="500">500 viajes</option>
+          </select>
+          <button class="button button-primary" id="start-drawing" type="button">Dibujar en el mapa</button>
+          <div class="button-row">
+            <button class="button button-secondary" id="undo-point" type="button" disabled>Deshacer punto</button>
+            <button class="button button-secondary" id="clear-polygon" type="button" disabled>Limpiar</button>
+          </div>
+          <button class="button button-primary hidden" id="search-polygon" type="button">Cerrar y buscar viajes <span aria-hidden="true">→</span></button>
+        </section>
+
+        <section class="query-panel hidden" id="aggregates-panel">
+          <div class="panel-heading">
+            <span class="step-number">03</span>
+            <div>
+              <h3>Actividad por zona</h3>
+              <p>Explora los resúmenes calculados con Spark.</p>
+            </div>
+          </div>
+          <div class="draw-hint">
+            <span class="hint-icon">▦</span>
+            <p>Se consultan las celdas agregadas que están dentro del área visible del mapa.</p>
+          </div>
+          <button class="button button-primary" id="search-aggregates" type="button">Consultar área visible <span aria-hidden="true">→</span></button>
+        </section>
+
+        <section class="results-panel" aria-live="polite">
+          <div class="results-heading">
+            <div>
+              <p class="eyebrow">RESULTADOS</p>
+              <h3 id="results-count">Listo para explorar</h3>
+            </div>
+            <span class="result-tag" id="result-tag">MONGODB</span>
+          </div>
+          <p class="message" id="message">Elige una consulta para mostrar datos en el mapa.</p>
+          <div class="result-list" id="result-list"></div>
+        </section>
+
+        <footer class="sidebar-footer">
+          <span class="footer-pulse"></span>
+          <span>Datos de trayectorias · 2013–2014</span>
+          <span class="footer-version">WGS84</span>
+        </footer>
+      </aside>
+
+      <section class="map-area" aria-label="Mapa y resultados geoespaciales">
+        <div class="map-toolbar">
+          <div class="map-label">
+            <span class="map-label-icon">⌖</span>
+            <div><strong>Porto, Portugal</strong><small id="map-caption">Vista de viajes cercanos</small></div>
+          </div>
+          <div class="map-legend" id="map-legend">
+            <span><i class="legend-dot trip-dot"></i> Viajes</span>
+            <span><i class="legend-dot center-dot"></i> Centro de búsqueda</span>
+          </div>
+        </div>
+        <div id="map" role="application" aria-label="Mapa interactivo de Porto"></div>
+        <div class="map-attribution">Mapa © <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noreferrer">OpenStreetMap</a></div>
+        <div class="map-toast hidden" id="map-toast" role="status"></div>
+      </section>
+    </main>
+
+    <script
+      src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
+      integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo="
+      crossorigin=""
+    ></script>
+    <script src="{{ url_for('static', filename='app.js') }}" defer></script>
+  </body>
+</html>

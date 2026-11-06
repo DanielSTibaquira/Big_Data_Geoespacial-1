@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from datetime import datetime, timezone
 
 import pytest
@@ -29,15 +30,22 @@ class FakeCursor(list):
         del self[count:]
         return self
 
+    def sort(self, key, direction):
+        self.sort_spec = (key, direction)
+        return self
+
 
 class FakeCollection:
-    def __init__(self, documents=None):
+    def __init__(self, documents=None, aggregate_result=None):
         self.documents = documents or []
         self.query = None
         self.pipeline = None
         self.projection = None
         self.indexes = []
         self.cursor = None
+        self.aggregate_result = aggregate_result or [
+            {"_id": "A", "trip_count": 3}
+        ]
 
     def find(self, query, projection=None):
         self.query = query
@@ -45,12 +53,12 @@ class FakeCollection:
         self.cursor = FakeCursor(self.documents)
         return self.cursor
 
-    def create_index(self, keys):
-        self.indexes.append(keys)
+    def create_index(self, keys, **kwargs):
+        self.indexes.append((keys, kwargs))
 
     def aggregate(self, pipeline):
         self.pipeline = pipeline
-        return FakeCursor([{"_id": "A", "trip_count": 3}])
+        return FakeCursor(self.aggregate_result)
 
 
 class FakeDatabase:
@@ -66,6 +74,22 @@ class FakeDatabase:
                 ]
             ),
             "trip_aggregates": FakeCollection([{"trip_count": 3}]),
+            "businesses": FakeCollection(
+                [{"business_id": "b1", "name": "Restaurant"}],
+                aggregate_result=[
+                    {
+                        "_id": None,
+                        "businesses": 4,
+                        "closures": 1,
+                        "days_business": 730,
+                        "average_sentiment": 0.25,
+                    }
+                ],
+            ),
+            "closure_rates": FakeCollection(
+                [{"group_type": "category", "key": "Italian", "rate_pct": 5.0}]
+            ),
+            "reviews": FakeCollection(),
         }
 
     def __getitem__(self, name):
@@ -85,9 +109,10 @@ class FakeClient:
         return {"ok": 1}
 
 
-def create_test_client():
+def create_test_client(model_path=None):
     mongo = FakeClient()
-    app = create_app(mongo)
+    app = create_app(mongo, model_path=model_path)
+    app.config["SERVICE_PROBE"] = lambda host, port: True
     app.config.update(TESTING=True)
     return app.test_client(), mongo
 
@@ -98,7 +123,34 @@ def test_health_endpoint_checks_mongodb():
     response = client.get("/health")
 
     assert response.status_code == 200
-    assert response.json == {"status": "ok"}
+    assert response.json["status"] == "ok"
+    assert response.json["services"] == {
+        "api": "ok",
+        "mongodb": "ok",
+        "spark": "ok",
+        "dask": "ok",
+    }
+
+
+def test_homepage_serves_lifemap_leaflet_frontend():
+    client, _ = create_test_client()
+
+    response = client.get("/")
+
+    assert response.status_code == 200
+    assert b"LifeMap | Restaurantes de Philadelphia" in response.data
+    assert b"id=\"business-search\"" in response.data
+    assert b"id=\"map\"" in response.data
+
+
+def test_taxi_frontend_remains_available():
+    client, _ = create_test_client()
+
+    response = client.get("/taxi")
+
+    assert response.status_code == 200
+    assert b"Taxi Geo Explorer" in response.data
+    assert b"id=\"map\"" in response.data
 
 
 def test_near_endpoint_builds_meter_based_geo_near_query_and_caps_results():
@@ -261,7 +313,7 @@ def test_near_aggregation_uses_geonear_then_groups_by_call_type():
     }
     assert trips.pipeline[0]["$geoNear"]["maxDistance"] == 500
     assert trips.pipeline[1]["$group"]["_id"] == "$call_type"
-    assert trips.indexes == [[("location", "2dsphere")]]
+    assert trips.indexes == [([("location", "2dsphere")], {})]
 
 
 def test_aggregate_endpoint_ensures_geospatial_index():
@@ -274,7 +326,7 @@ def test_aggregate_endpoint_ensures_geospatial_index():
 
     assert response.status_code == 200
     assert mongo.database.collections["trip_aggregates"].indexes == [
-        [("cell_center", "2dsphere")]
+        ([("cell_center", "2dsphere")], {})
     ]
 
 
@@ -291,3 +343,117 @@ def test_api_rejects_invalid_coordinates_and_bounding_boxes():
 
     assert invalid_coordinate.status_code == 400
     assert invalid_box.status_code == 400
+
+
+def test_businesses_near_uses_geo_near_and_optional_category():
+    client, mongo = create_test_client()
+
+    response = client.get(
+        "/businesses/near?lon=-75.16&lat=39.95&radius_m=1000"
+        "&category=Italian&limit=5"
+    )
+
+    businesses = mongo.database.collections["businesses"]
+    assert response.status_code == 200
+    assert response.json["count"] == 1
+    assert businesses.query == {
+        "location": {
+            "$near": {
+                "$geometry": {
+                    "type": "Point",
+                    "coordinates": [-75.16, 39.95],
+                },
+                "$maxDistance": 1000,
+            }
+        },
+        "categories": "Italian",
+    }
+    assert businesses.indexes == [
+        ([("location", "2dsphere")], {"name": "location_2dsphere"})
+    ]
+
+
+def test_businesses_within_accepts_geojson_polygon():
+    client, mongo = create_test_client()
+
+    response = client.post(
+        "/businesses/within",
+        json={"polygon": VALID_POLYGON, "limit": 1},
+    )
+
+    businesses = mongo.database.collections["businesses"]
+    assert response.status_code == 200
+    assert businesses.query == {
+        "location": {"$geoWithin": {"$geometry": VALID_POLYGON}}
+    }
+    assert businesses.cursor.limit_count == 1
+
+
+def test_zones_summary_uses_geonear_and_annualized_exposure_rate():
+    client, mongo = create_test_client()
+
+    response = client.get(
+        "/zones/summary?lon=-75.16&lat=39.95&radius_m=1000"
+        "&min_days_business=100"
+    )
+
+    businesses = mongo.database.collections["businesses"]
+    assert response.status_code == 200
+    assert response.json["closure_rate_pct"] == pytest.approx(50.0)
+    assert businesses.pipeline[0]["$geoNear"]["maxDistance"] == 1000
+    assert businesses.pipeline[1]["$match"] == {
+        "life.days_business": {"$gte": 100.0}
+    }
+
+
+def test_closure_stats_requires_one_group_and_minimum_exposure():
+    client, mongo = create_test_client()
+
+    response = client.get(
+        "/stats/closure?category=Italian&min_days_business=500"
+    )
+
+    closure_rates = mongo.database.collections["closure_rates"]
+    assert response.status_code == 200
+    assert closure_rates.query == {
+        "group_type": "category",
+        "key": "Italian",
+        "days_business": {"$gte": 500.0},
+    }
+    assert closure_rates.cursor.sort_spec == ("rate_pct", -1)
+
+    invalid = client.get("/stats/closure")
+    assert invalid.status_code == 400
+
+
+def test_predict_uses_exported_logistic_model(tmp_path):
+    model_path = tmp_path / "model_serving.json"
+    model_path.write_text(
+        json.dumps(
+            {
+                "format": "lifemap-logistic-v1",
+                "model_name": "logistic_regression",
+                "labels": ["negative", "neutral", "positive"],
+                "stop_words": [],
+                "vocabulary": {"good": 0, "bad": 1},
+                "idf": [1.0, 1.0],
+                "coefficients": [[-2.0, 2.0], [0.0, 0.0], [2.0, -2.0]],
+                "intercepts": [0.0, 0.0, 0.0],
+            }
+        ),
+        encoding="utf-8",
+    )
+    client, _ = create_test_client(model_path)
+
+    response = client.post("/predict", json={"text": "Good food"})
+
+    assert response.status_code == 200
+    assert response.json["sentiment"] == "positive"
+    assert sum(response.json["probabilities"].values()) == pytest.approx(1.0)
+
+
+def test_predict_reports_missing_model_and_rejects_empty_text():
+    client, _ = create_test_client()
+
+    assert client.post("/predict", json={"text": "Nice"}).status_code == 503
+    assert client.post("/predict", json={"text": "  "}).status_code == 400

@@ -60,7 +60,9 @@ services:
       - ./data:/data:ro
 
   spark-master:
-    image: apache/spark:3.5.7
+    image: lifemap-spark:3.5.7
+    build:
+      context: ./spark
     restart: unless-stopped
     environment:
       SPARK_NO_DAEMONIZE: "true"
@@ -77,15 +79,18 @@ services:
       - ./spark:/opt/spark-apps:ro
       - ./benchmark:/opt/benchmark:ro
       - ./data:/data:ro
+      - ./data/lifemap:/lifemap
       - ./benchmark/results:/results
 
   spark-worker:
-    image: apache/spark:3.5.7
+    image: lifemap-spark:3.5.7
+    build:
+      context: ./spark
     restart: unless-stopped
     environment:
       SPARK_NO_DAEMONIZE: "true"
       SPARK_WORKER_CORES: "1"
-      SPARK_WORKER_MEMORY: 1g
+      SPARK_WORKER_MEMORY: 2g
       SPARK_WORKER_WEBUI_PORT: "8081"
     command:
       - /opt/spark/bin/spark-class
@@ -99,6 +104,7 @@ services:
       - ./spark:/opt/spark-apps:ro
       - ./benchmark:/opt/benchmark:ro
       - ./data:/data:ro
+      - ./data/lifemap:/lifemap
 
   api:
     image: taxi-geospatial-api:local
@@ -110,11 +116,25 @@ services:
       MONGO_DATABASE: taxi_geospatial
       MONGO_COLLECTION: trips
       MONGO_AGGREGATES_COLLECTION: trip_aggregates
+      LIFEMAP_DATABASE: lifemap
+      LIFEMAP_BUSINESSES_COLLECTION: businesses
+      LIFEMAP_REVIEWS_COLLECTION: reviews
+      LIFEMAP_CLOSURE_COLLECTION: closure_rates
+      LIFEMAP_MODEL_PATH: /lifemap/model_serving.json
+      SPARK_MASTER_HOST: spark-master
+      DASK_SCHEDULER_HOST: dask-scheduler
+      GIT_COMMIT: ${GIT_COMMIT:-unknown}
     ports:
       - "127.0.0.1:5000:5000"
+    volumes:
+      - ./data/lifemap:/lifemap:ro
     depends_on:
       mongodb:
         condition: service_healthy
+      dask-scheduler:
+        condition: service_started
+      spark-master:
+        condition: service_started
 
   benchmark-dask:
     image: daskdev/dask:2026.8.0-py3.12
@@ -153,9 +173,23 @@ services:
       MONGO_DATABASE: taxi_geospatial
       MONGO_COLLECTION: trips
       MONGO_AGGREGATES_COLLECTION: trip_aggregates
+      LIFEMAP_DATABASE: lifemap
+      LIFEMAP_BUSINESSES_COLLECTION: businesses
+      LIFEMAP_REVIEWS_COLLECTION: reviews
+      LIFEMAP_CLOSURE_COLLECTION: closure_rates
+      LIFEMAP_MODEL_PATH: /lifemap/model_serving.json
+      SPARK_MASTER_HOST: spark-master
+      DASK_SCHEDULER_HOST: dask-scheduler
+      GIT_COMMIT: ${GIT_COMMIT:-unknown}
+    volumes:
+      - ./data/lifemap:/lifemap:ro
     depends_on:
       mongodb:
         condition: service_healthy
+      dask-scheduler:
+        condition: service_started
+      spark-master:
+        condition: service_started
 
   jenkins:
     build:
@@ -189,6 +223,33 @@ services:
       DASK_EXPECTED_WORKERS: "2"
     volumes:
       - ./data:/data:ro
+    depends_on:
+      mongodb:
+        condition: service_healthy
+      dask-scheduler:
+        condition: service_started
+      dask-worker-1:
+        condition: service_started
+      dask-worker-2:
+        condition: service_started
+
+  yelp-ingest:
+    build:
+      context: ./ingestion
+    profiles:
+      - jobs
+    entrypoint: ["python", "-m", "ingestion.yelp_ingest"]
+    environment:
+      KAGGLEHUB_CACHE: /data/kagglehub
+      KAGGLE_CONFIG_DIR: /data/.kaggle-ci
+      MONGO_URI: mongodb://mongodb:27017
+      YELP_MONGO_DATABASE: lifemap
+      YELP_BUSINESSES_COLLECTION: businesses
+      YELP_REVIEWS_COLLECTION: reviews
+      DASK_SCHEDULER_ADDRESS: tcp://dask-scheduler:8786
+      DASK_EXPECTED_WORKERS: "2"
+    volumes:
+      - ./data:/data
     depends_on:
       mongodb:
         condition: service_healthy

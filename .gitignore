@@ -2,6 +2,11 @@
 /data/*.csv
 /data/*.zip
 /data/*.gz
+/data/*.json
+/data/kagglehub/
+/data/yelp/
+/data/lifemap/
+/data/.kaggle-ci/
 
 # Salidas de análisis
 **/train_sample_extended.csv.gz

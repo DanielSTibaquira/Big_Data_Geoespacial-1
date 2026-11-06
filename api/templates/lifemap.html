@@ -1,0 +1,133 @@
+<!doctype html>
+<html lang="es">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="theme-color" content="#111827">
+    <title>LifeMap | Restaurantes de Philadelphia</title>
+    <link rel="preconnect" href="https://unpkg.com">
+    <link rel="preconnect" href="https://tile.openstreetmap.org">
+    <link
+      rel="stylesheet"
+      href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
+      integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY="
+      crossorigin=""
+    >
+    <link rel="stylesheet" href="{{ url_for('static', filename='lifemap.css') }}">
+  </head>
+  <body>
+    <header class="topbar">
+      <a class="brand" href="/" aria-label="LifeMap inicio">
+        <span class="brand-icon" aria-hidden="true">L</span>
+        <span><strong>LifeMap</strong><small>BIG DATA · YELP OPEN DATASET</small></span>
+      </a>
+      <div class="topbar-location"><span aria-hidden="true">⌖</span> Philadelphia, PA · Restaurantes</div>
+      <a class="legacy-link" href="/taxi">Explorador de taxis <span aria-hidden="true">↗</span></a>
+    </header>
+
+    <main class="dashboard">
+      <aside class="control-panel">
+        <section class="intro">
+          <p class="eyebrow">REPUTACIÓN · UBICACIÓN · SUPERVIVENCIA</p>
+          <h1>Encuentra el pulso<br>de cada barrio.</h1>
+          <p>Explora restaurantes cercanos y compara su reputación con la tasa de cierre estimada de la zona.</p>
+        </section>
+
+        <section class="health-card" id="health-card" aria-live="polite">
+          <div class="health-heading">
+            <span class="health-indicator" id="health-indicator"></span>
+            <strong id="health-title">Conectando servicios...</strong>
+            <button type="button" class="icon-button" id="refresh-health" aria-label="Actualizar estado">↻</button>
+          </div>
+          <div class="service-list" id="service-list"></div>
+        </section>
+
+        <form class="search-form" id="business-search">
+          <div class="section-title">
+            <span class="section-number">01</span>
+            <div><h2>Explorar restaurantes</h2><p>Elige un punto en el mapa o ajusta la búsqueda.</p></div>
+          </div>
+          <div class="coordinate-grid">
+            <label>LONGITUD<input id="longitude" name="longitude" type="number" step="any" value="-75.1636" min="-180" max="180" required></label>
+            <label>LATITUD<input id="latitude" name="latitude" type="number" step="any" value="39.9526" min="-90" max="90" required></label>
+          </div>
+          <label class="field-label" for="radius">Radio <strong id="radius-label">5 km</strong></label>
+          <input id="radius" name="radius" type="range" min="500" max="20000" step="500" value="5000">
+          <div class="field-row">
+            <label for="category">Categoría <span class="optional">opcional</span></label>
+            <input id="category" name="category" type="text" maxlength="80" placeholder="p. ej. Italian">
+          </div>
+          <div class="field-row">
+            <label for="limit">Resultados</label>
+            <select id="limit" name="limit">
+              <option value="50">50 locales</option>
+              <option value="100" selected>100 locales</option>
+              <option value="250">250 locales</option>
+              <option value="500">500 locales</option>
+            </select>
+          </div>
+          <button class="primary-button" id="search-button" type="submit">Buscar en el mapa <span aria-hidden="true">→</span></button>
+          <p class="form-message" id="search-message" role="status">Haz clic en el mapa para mover el centro.</p>
+        </form>
+
+        <section class="zone-section">
+          <div class="section-title compact">
+            <span class="section-number">02</span>
+            <div><h2>Resumen de la zona</h2><p>Negocios con al menos un año de exposición.</p></div>
+          </div>
+          <div class="metric-grid" id="zone-metrics" aria-live="polite">
+            <div class="metric"><span>Locales</span><strong id="metric-businesses">—</strong></div>
+            <div class="metric"><span>Cierres observados</span><strong id="metric-closures">—</strong></div>
+            <div class="metric metric-highlight"><span>Tasa anualizada</span><strong id="metric-rate">—</strong></div>
+            <div class="metric"><span>Sentimiento medio</span><strong id="metric-sentiment">—</strong></div>
+          </div>
+          <p class="metric-note" id="metric-note">Ejecuta una búsqueda para cargar el resumen.</p>
+        </section>
+
+        <section class="predict-section">
+          <div class="section-title compact">
+            <span class="section-number">03</span>
+            <div><h2>Probar sentimiento</h2><p>Clasifica un texto con el modelo entrenado.</p></div>
+          </div>
+          <form id="predict-form">
+            <textarea id="review-text" maxlength="20000" rows="3" placeholder="Escribe una reseña en inglés..." required></textarea>
+            <button class="secondary-button" id="predict-button" type="submit">Analizar reseña</button>
+          </form>
+          <div class="prediction-result hidden" id="prediction-result" aria-live="polite"></div>
+        </section>
+
+        <section class="results-section">
+          <div class="results-heading">
+            <div><p class="eyebrow">RESULTADOS</p><h2 id="results-title">Locales cercanos</h2></div>
+            <span class="count-pill" id="results-count">—</span>
+          </div>
+          <p class="results-message" id="results-message">Los restaurantes encontrados aparecerán aquí.</p>
+          <div class="business-list" id="business-list"></div>
+        </section>
+
+        <footer class="sidebar-footer">
+          <span>Fuente: Yelp Open Dataset</span>
+          <span><a href="/health">API</a> · GeoJSON WGS84</span>
+        </footer>
+      </aside>
+
+      <section class="map-panel" aria-label="Mapa de restaurantes de Philadelphia">
+        <div id="map" role="application" aria-label="Mapa interactivo de restaurantes"></div>
+        <div class="map-heading">
+          <div class="map-heading-icon" aria-hidden="true">⌖</div>
+          <div><strong>Philadelphia</strong><span>Selecciona un punto para buscar restaurantes</span></div>
+          <div class="map-legend"><i></i> Restaurante</div>
+        </div>
+        <div class="map-attribution">© <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noreferrer">OpenStreetMap</a></div>
+        <div class="map-toast hidden" id="map-toast" role="status"></div>
+      </section>
+    </main>
+
+    <script
+      src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
+      integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo="
+      crossorigin=""
+    ></script>
+    <script src="{{ url_for('static', filename='lifemap.js') }}" defer></script>
+  </body>
+</html>
