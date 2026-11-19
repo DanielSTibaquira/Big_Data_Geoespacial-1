@@ -203,7 +203,7 @@ pipeline {
                     fi
                     if [ "$BRANCH_NAME" = main ]; then
                         compose --profile e2 --profile jobs run --build --rm \
-                            replay-reviews --rate 1000 --limit 3
+                            replay-reviews --rate 1000 --limit 100
                     fi
                     python3 - <<'PY'
 import json
@@ -368,6 +368,7 @@ PY
                     if [ "$BRANCH_NAME" = main ]; then
                         python3 - <<'PY'
 import json
+import os
 import time
 import urllib.request
 
@@ -384,7 +385,27 @@ while time.monotonic() < deadline:
     time.sleep(2)
 else:
     raise SystemExit(f"Streaming did not drain the replayed messages: {last_payload!r}")
+
+model_path = os.path.join(
+    os.environ["WORKSPACE"],
+    "data",
+    "lifemap",
+    "model_serving_as_of_2021-01-01.json",
+)
+with open(model_path, encoding="utf-8") as fh:
+    serving_model = json.load(fh)
+cutoff = str(serving_model.get("cutoff") or serving_model.get("train_cutoff") or "")
+if "2021-01-01" not in cutoff:
+    raise SystemExit(f"Expected versioned model cutoff 2021-01-01, got: {cutoff!r}")
+print("Versioned sentiment model check passed (cutoff 2021-01-01)")
 PY
+                        features_count=$(compose exec -T mongodb mongosh --quiet --eval "db.getSiblingDB('lifemap').risk_features.countDocuments({})")
+                        hotspots_count=$(compose exec -T mongodb mongosh --quiet --eval "db.getSiblingDB('lifemap').live_hotspots.countDocuments({})")
+                        echo "MongoDB streaming collections -> risk_features: $features_count, live_hotspots: $hotspots_count"
+                        if [ "$features_count" -lt 1 ]; then
+                            echo "Expected streaming features classified in MongoDB, found $features_count"
+                            exit 1
+                        fi
                     fi
                     cleanup_candidate
                     trap - EXIT
