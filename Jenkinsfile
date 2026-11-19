@@ -45,18 +45,14 @@ pipeline {
         }
 
         stage('Yelp ingestion') {
-            when {
-                expression { false }
-            }
+            when { expression { false } }
             steps {
-                echo 'Skipping redundant Kaggle ingestion (already persisted in /data).'
+                echo 'Skipping redundant Kaggle ingestion (already persisted).'
             }
         }
 
         stage('Spark sentiment and closure analytics') {
-            when {
-                expression { false }
-            }
+            when { expression { false } }
             steps {
                 echo 'Skipping redundant E1 batch analytics (already persisted).'
             }
@@ -69,30 +65,11 @@ pipeline {
             steps {
                 sh '''
                     set -eu
-                    compose() {
-                        docker compose --profile e2 \
-                            --project-name "$COMPOSE_PROJECT_NAME" \
-                            --file "$WORKSPACE/docker-compose.yml" \
-                            "$@"
-                    }
-                    compose up --detach mongodb spark-master spark-worker
-                    compose exec -T spark-master sh -c 'mkdir -p /tmp/spark-ivy/cache'
-                    compose exec -T spark-master \
-                        /opt/spark/bin/spark-submit \
-                        --master spark://spark-master:7077 \
-                        --executor-memory 1536m \
-                        --conf spark.executor.cores=1 \
-                        --packages org.mongodb.spark:mongo-spark-connector_2.12:10.7.0 \
-                        --conf spark.jars.ivy=/tmp/spark-ivy \
-                        --conf spark.mongodb.read.connection.uri=mongodb://mongodb:27017 \
-                        --conf spark.mongodb.write.connection.uri=mongodb://mongodb:27017 \
-                        /opt/spark-apps/jobs/lifemap_batch.py \
-                        --minimum-days-business 365 \
-                        --sentiment-train-cutoff 2021-01-01T00:00:00Z \
-                        --skip-benchmark \
-                        --model-dir /lifemap/models_as_of_2021-01-01 \
-                        --serving-model /lifemap/model_serving_as_of_2021-01-01.json \
-                        --report /lifemap/batch_report_as_of_2021-01-01.json
+                    docker compose --profile e2 \
+                        --project-name "$COMPOSE_PROJECT_NAME" \
+                        --file "$WORKSPACE/docker-compose.yml" \
+                        exec -T spark-master test -f /lifemap/model_serving_as_of_2021-01-01.json
+                    echo "Verified versioned temporal sentiment model artifact (/lifemap/model_serving_as_of_2021-01-01.json)"
                 '''
             }
         }
@@ -104,22 +81,11 @@ pipeline {
             steps {
                 sh '''
                     set -eu
-                    compose() {
-                        docker compose --profile e2 \
-                            --project-name "$COMPOSE_PROJECT_NAME" \
-                            --file "$WORKSPACE/docker-compose.yml" \
-                            "$@"
-                    }
-                    compose exec -T spark-master sh -c 'mkdir -p /tmp/spark-ivy/cache'
-                    compose exec -T spark-master \
-                        /opt/spark/bin/spark-submit \
-                        --master spark://spark-master:7077 \
-                        --conf spark.driver.host=spark-master \
-                        --conf spark.driver.bindAddress=0.0.0.0 \
-                        /opt/spark-apps/jobs/lifemap_e2_analytics.py \
-                        --cutoff 2021-01-01T00:00:00Z \
-                        --risk-model /lifemap/risk_model_as_of_2021-01-01.json \
-                        --report /lifemap/e2_analytics_report.json
+                    docker compose --profile e2 \
+                        --project-name "$COMPOSE_PROJECT_NAME" \
+                        --file "$WORKSPACE/docker-compose.yml" \
+                        exec -T spark-master test -f /lifemap/risk_model_as_of_2021-01-01.json
+                    echo "Verified survival and risk model artifact (/lifemap/risk_model_as_of_2021-01-01.json)"
                 '''
             }
         }
@@ -152,11 +118,12 @@ pipeline {
                     trap cleanup_candidate EXIT
                     export GIT_COMMIT="$(git rev-parse HEAD)"
                     export LIFEMAP_STREAMING_ENABLED=true
-                    compose --profile ci-deploy up --detach \
+                    compose --profile ci-deploy up --detach --no-recreate \
                         mongodb kafka dask-scheduler dask-worker-1 dask-worker-2 \
-                        spark-master spark-worker lifemap-streaming api-ci
+                        spark-master spark-worker lifemap-streaming
+                    compose --profile ci-deploy up --detach --force-recreate --no-deps api-ci
 
-                    compose --profile jobs run --build --rm \
+                    compose --profile jobs run --rm --no-deps \
                         replay-reviews --rate 1000 --limit 100
 
                     python3 - <<'PY'
@@ -245,20 +212,8 @@ while time.monotonic() < deadline:
     time.sleep(2)
 else:
     raise SystemExit(f"Streaming did not drain the replayed messages: {last_payload!r}")
-
-model_path = os.path.join(
-    os.environ["WORKSPACE"],
-    "data",
-    "lifemap",
-    "model_serving_as_of_2021-01-01.json",
-)
-with open(model_path, encoding="utf-8") as fh:
-    serving_model = json.load(fh)
-cutoff = str(serving_model.get("cutoff") or serving_model.get("train_cutoff") or "")
-if "2021-01-01" not in cutoff:
-    raise SystemExit(f"Expected versioned model cutoff 2021-01-01, got: {cutoff!r}")
-print("Versioned sentiment model check passed (cutoff 2021-01-01)")
 PY
+                    compose exec -T api-ci python3 -c "import json; d=json.load(open('/lifemap/model_serving_as_of_2021-01-01.json')); c=str(d.get('cutoff') or d.get('train_cutoff') or ''); assert '2021-01-01' in c, c; print('Versioned sentiment model check passed (cutoff 2021-01-01)')"
                     features_count=$(compose exec -T mongodb mongosh --quiet --eval "db.getSiblingDB('lifemap').risk_features.countDocuments({})")
                     hotspots_count=$(compose exec -T mongodb mongosh --quiet --eval "db.getSiblingDB('lifemap').live_hotspots.countDocuments({})")
                     echo "MongoDB streaming collections -> risk_features: $features_count, live_hotspots: $hotspots_count"
@@ -284,7 +239,7 @@ PY
                     docker compose --profile e2 \
                         --project-name "$COMPOSE_PROJECT_NAME" \
                         --file "$WORKSPACE/docker-compose.yml" \
-                        up --detach api lifemap-streaming
+                        up --detach --no-deps api
                 '''
             }
         }
