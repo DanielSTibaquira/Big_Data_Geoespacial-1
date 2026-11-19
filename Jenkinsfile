@@ -45,9 +45,8 @@ environment {
         }
 
         stage('Yelp ingestion') {
-            when {
-                environment name: 'BRANCH_NAME', value: 'main'
-            }
+                when { expression { false } }
+            
             steps {
                 withCredentials([file(credentialsId: 'kaggle-json', variable: 'KAGGLE_JSON')]) {
                     sh '''
@@ -59,9 +58,9 @@ environment {
                         chmod 600 "$config_dir/kaggle.json"
 
                         compose() {
-                            docker-compose \
+                            docker compose --profile e2 \ \
                                 --project-name "$COMPOSE_PROJECT_NAME" \
-                                --file "$WORKSPACE/docker-compose.yml" \
+                                --file "$WORKSPACE/docker compose --profile e2 \.yml" \
                                 "$@"
                         }
                         compose --profile jobs up --detach \
@@ -75,16 +74,14 @@ environment {
         }
 
         stage('Spark sentiment and closure analytics') {
-            when {
-                environment name: 'BRANCH_NAME', value: 'main'
-            }
+            when { expression { false } }
             steps {
                 sh '''
                     set -eu
                     compose() {
-                        docker-compose \
+                        docker compose --profile e2 \ \
                             --project-name "$COMPOSE_PROJECT_NAME" \
-                            --file "$WORKSPACE/docker-compose.yml" \
+                            --file "$WORKSPACE/docker compose --profile e2 \.yml" \
                             "$@"
                     }
                     compose up --build --force-recreate --detach \
@@ -112,9 +109,9 @@ environment {
                 sh '''
                     set -eu
                     compose() {
-                        docker-compose \
+                        docker compose --profile e2 \ \
                             --project-name "$COMPOSE_PROJECT_NAME" \
-                            --file "$WORKSPACE/docker-compose.yml" \
+                            --file "$WORKSPACE/docker compose --profile e2 \.yml" \
                             "$@"
                     }
                     compose exec -T spark-master sh -c 'mkdir -p /tmp/spark-ivy/cache'
@@ -146,9 +143,9 @@ environment {
                 sh '''
                     set -eu
                     compose() {
-                        docker-compose \
+                        docker compose --profile e2 \ \
                             --project-name "$COMPOSE_PROJECT_NAME" \
-                            --file "$WORKSPACE/docker-compose.yml" \
+                            --file "$WORKSPACE/docker compose --profile e2 \.yml" \
                             "$@"
                     }
                     compose exec -T spark-master sh -c 'mkdir -p /tmp/spark-ivy/cache'
@@ -169,9 +166,9 @@ environment {
             steps {
                 sh '''
                     set -eu
-                    docker-compose \
+                    docker compose --profile e2 \ \
                         --project-name "$COMPOSE_PROJECT_NAME" \
-                        --file "$WORKSPACE/docker-compose.yml" \
+                        --file "$WORKSPACE/docker compose --profile e2 \.yml" \
                         build api
                 '''
             }
@@ -182,9 +179,9 @@ environment {
                 sh '''
                     set -eu
                     compose() {
-                        docker-compose \
+                        docker compose --profile e2 \ \
                             --project-name "$COMPOSE_PROJECT_NAME" \
-                            --file "$WORKSPACE/docker-compose.yml" \
+                            --file "$WORKSPACE/docker compose --profile e2 \.yml" \
                             "$@"
                     }
                     cleanup_candidate() {
@@ -423,9 +420,9 @@ PY
                     set -eu
                     export GIT_COMMIT="$(git rev-parse HEAD)"
                     export LIFEMAP_STREAMING_ENABLED=true
-                    docker-compose \
+                    docker compose --profile e2 \ \
                         --project-name "$COMPOSE_PROJECT_NAME" \
-                        --file "$WORKSPACE/docker-compose.yml" \
+                        --file "$WORKSPACE/docker compose --profile e2 \.yml" \
                         --profile e2 \
                         up --detach api lifemap-streaming
                 '''
