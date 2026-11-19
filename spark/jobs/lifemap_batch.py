@@ -6,15 +6,34 @@ import math
 import os
 import statistics
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from lifemap_metrics import annualized_closure_rate, encode_geohash
+if __package__:
+    from .lifemap_metrics import annualized_closure_rate, encode_geohash
+else:
+    from lifemap_metrics import annualized_closure_rate, encode_geohash
 
 
 LABELS = ("negative", "neutral", "positive")
 LABEL_INDEX = {label: index for index, label in enumerate(LABELS)}
 PARTITION_COUNTS = (2, 8, 32, 200)
+
+
+def _parse_utc_cutoff(value: str) -> datetime:
+    normalized = f"{value[:-1]}+00:00" if value.endswith("Z") else value
+    try:
+        cutoff = datetime.fromisoformat(normalized)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(
+            "cutoff must be an ISO-8601 datetime with a timezone"
+        ) from error
+    if cutoff.tzinfo is None or cutoff.utcoffset() is None:
+        raise argparse.ArgumentTypeError(
+            "cutoff must include a timezone, for example 2021-01-01T00:00:00Z"
+        )
+    return cutoff.astimezone(timezone.utc)
 
 
 def parse_args() -> argparse.Namespace:
@@ -28,6 +47,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--closure-collection", default="closure_rates")
     parser.add_argument("--minimum-days-business", type=float, default=365)
     parser.add_argument("--geohash-precision", type=int, default=5)
+    parser.add_argument(
+        "--sentiment-train-cutoff",
+        type=_parse_utc_cutoff,
+        help="Exclude sentiment reviews after this ISO-8601 cutoff from training.",
+    )
     parser.add_argument("--model-dir", type=Path, default=Path("/lifemap/models"))
     parser.add_argument(
         "--serving-model",
@@ -264,6 +288,8 @@ def train_sentiment_models(
     reviews: Any,
     model_dir: Path,
     serving_model_path: Path,
+    *,
+    training_cutoff: datetime | None = None,
 ) -> dict[str, Any]:
     from pyspark.ml import Pipeline, PipelineModel
     from pyspark.ml.classification import LogisticRegression, NaiveBayes
@@ -277,14 +303,30 @@ def train_sentiment_models(
     )
     from pyspark.sql import functions as F
 
-    labeled = (
-        reviews.select("business_id", "text", "sentiment")
+    eligible_reviews = (
+        reviews.select("business_id", "text", "sentiment", "date")
         .where(
             F.col("business_id").isNotNull()
             & F.col("text").isNotNull()
             & F.col("sentiment").isin(*LABELS)
         )
-        .withColumn(
+    )
+    excluded_after_cutoff = 0
+    excluded_missing_date = 0
+    if training_cutoff is not None:
+        cutoff_value = F.lit(training_cutoff)
+        excluded_after_cutoff = eligible_reviews.where(
+            F.col("date") > cutoff_value
+        ).count()
+        excluded_missing_date = eligible_reviews.where(
+            F.col("date").isNull()
+        ).count()
+        eligible_reviews = eligible_reviews.where(
+            F.col("date").isNotNull() & (F.col("date") <= cutoff_value)
+        )
+
+    labeled = (
+        eligible_reviews.withColumn(
             "label",
             F.when(F.col("sentiment") == "negative", 0.0)
             .when(F.col("sentiment") == "neutral", 1.0)
@@ -368,6 +410,13 @@ def train_sentiment_models(
             "test_businesses": test_businesses,
             "class_distribution": class_distribution,
             "business_overlap": 0,
+            "training_cutoff_utc": (
+                training_cutoff.isoformat().replace("+00:00", "Z")
+                if training_cutoff is not None
+                else None
+            ),
+            "excluded_after_cutoff_rows": excluded_after_cutoff,
+            "excluded_missing_date_rows": excluded_missing_date,
             "features": "RegexTokenizer + English StopWordsRemover + CountVectorizer + IDF",
         },
         "models": {},
@@ -397,6 +446,11 @@ def train_sentiment_models(
     serving_payload = {
         "format": "lifemap-logistic-v1",
         "model_name": "logistic_regression",
+        "training_cutoff_utc": (
+            training_cutoff.isoformat().replace("+00:00", "Z")
+            if training_cutoff is not None
+            else None
+        ),
         "labels": list(LABELS),
         "stop_words": StopWordsRemover.loadDefaultStopWords("english"),
         "vocabulary": {
@@ -508,7 +562,9 @@ def main() -> None:
             args.mongo_uri,
             args.database,
             args.reviews_collection,
-        ).select("business_id", "text", "sentiment").persist(StorageLevel.DISK_ONLY)
+        ).select("business_id", "text", "sentiment", "date").persist(
+            StorageLevel.DISK_ONLY
+        )
         business_base = businesses.where(
             F.col("life.days_business").isNotNull()
             & F.col("life.event").isNotNull()
@@ -525,6 +581,7 @@ def main() -> None:
                 reviews,
                 args.model_dir,
                 args.serving_model,
+                training_cutoff=args.sentiment_train_cutoff,
             )
             closure_frame, closure_results = compute_closure_rates(
                 spark,

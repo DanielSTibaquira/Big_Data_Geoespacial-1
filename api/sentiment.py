@@ -34,23 +34,28 @@ def predict_sentiment(text: str, model: dict[str, Any]) -> dict[str, Any]:
         index: count * float(model["idf"][index])
         for index, count in counts.items()
     }
+    intercepts = model["intercepts"]
+    coefficients = model["coefficients"]
+    if len(intercepts) != len(coefficients):
+        raise ValueError("Sentiment model has inconsistent class coefficients")
     scores = [
         float(intercept)
         + sum(
             feature_values.get(index, 0.0) * float(weight)
-            for index, weight in enumerate(coefficients)
+            for index, weight in enumerate(class_coefficients)
             if index in feature_values
         )
-        for intercept, coefficients in zip(
-            model["intercepts"], model["coefficients"], strict=True
-        )
+        for intercept, class_coefficients in zip(intercepts, coefficients)
     ]
     maximum = max(scores)
     exponentials = [math.exp(score - maximum) for score in scores]
     denominator = sum(exponentials)
+    labels = model["labels"]
+    if len(labels) != len(exponentials):
+        raise ValueError("Sentiment model has inconsistent class labels")
     probabilities = {
         label: probability / denominator
-        for label, probability in zip(model["labels"], exponentials, strict=True)
+        for label, probability in zip(labels, exponentials)
     }
     prediction = max(probabilities, key=probabilities.__getitem__)
     return {

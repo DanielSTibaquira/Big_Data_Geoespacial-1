@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import json
 from datetime import datetime, timezone
+from urllib.parse import quote
 
 import pytest
 
-from api.app import create_app
+from api.app import _kafka_consumer_lag, create_app
 
 VALID_POLYGON = {
     "type": "Polygon",
@@ -53,6 +54,18 @@ class FakeCollection:
         self.cursor = FakeCursor(self.documents)
         return self.cursor
 
+    def find_one(self, query, projection=None):
+        self.query = query
+        self.projection = projection
+        return next(
+            (
+                document
+                for document in self.documents
+                if all(document.get(key) == value for key, value in query.items())
+            ),
+            None,
+        )
+
     def create_index(self, keys, **kwargs):
         self.indexes.append((keys, kwargs))
 
@@ -90,6 +103,30 @@ class FakeDatabase:
                 [{"group_type": "category", "key": "Italian", "rate_pct": 5.0}]
             ),
             "reviews": FakeCollection(),
+            "live_hotspots": FakeCollection(
+                [
+                    {
+                        "hotspot": True,
+                        "geohash": "dr4e3",
+                        "window_end": datetime(2022, 1, 31, tzinfo=timezone.utc),
+                    }
+                ]
+            ),
+            "alerts": FakeCollection([{"business_id": "b1"}]),
+            "survival_curves": FakeCollection(
+                [
+                    {
+                        "_id": "category:Italian",
+                        "group_type": "category",
+                        "key": "Italian",
+                        "businesses": 25,
+                        "suppressed": False,
+                        "points": [{"time_days": 10, "at_risk": 25}],
+                    }
+                ]
+            ),
+            "risk_scores": FakeCollection(),
+            "stream_status": FakeCollection(),
         }
 
     def __getitem__(self, name):
@@ -130,6 +167,55 @@ def test_health_endpoint_checks_mongodb():
         "spark": "ok",
         "dask": "ok",
     }
+
+
+def test_kafka_lag_compares_high_watermarks_with_processed_offsets(monkeypatch):
+    import kafka
+    from kafka.structs import TopicPartition
+
+    class FakeConsumer:
+        def __init__(self, **kwargs):
+            pass
+
+        def partitions_for_topic(self, topic):
+            assert topic == "reviews"
+            return {0, 1, 2}
+
+        def end_offsets(self, partitions):
+            return {
+                TopicPartition("reviews", 0): 10,
+                TopicPartition("reviews", 1): 2,
+                TopicPartition("reviews", 2): 5,
+            }
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(kafka, "KafkaConsumer", FakeConsumer)
+
+    lag = _kafka_consumer_lag(
+        "kafka:9092",
+        "reviews",
+        {"0": 5, "2": 4},
+    )
+
+    assert lag == 6
+
+
+def test_health_exposes_kafka_streaming_and_lag_when_e2_is_enabled(monkeypatch):
+    monkeypatch.setenv("KAFKA_BOOTSTRAP_SERVERS", "kafka:9092")
+    monkeypatch.setenv("LIFEMAP_STREAMING_ENABLED", "true")
+    monkeypatch.setattr("api.app._kafka_consumer_lag", lambda *args: 0)
+    app = create_app(FakeClient())
+    app.config["SERVICE_PROBE"] = lambda host, port: True
+    app.config.update(TESTING=True)
+
+    response = app.test_client().get("/health")
+
+    assert response.status_code == 200
+    assert response.json["services"]["kafka"] == "ok"
+    assert response.json["services"]["streaming"] == "ok"
+    assert response.json["consumer_lag"] == {"messages": 0, "status": "ok"}
 
 
 def test_homepage_serves_lifemap_leaflet_frontend():
@@ -457,3 +543,95 @@ def test_predict_reports_missing_model_and_rejects_empty_text():
 
     assert client.post("/predict", json={"text": "Nice"}).status_code == 503
     assert client.post("/predict", json={"text": "  "}).status_code == 400
+
+
+def test_live_hotspots_requires_radius_and_applies_window_filter():
+    client, mongo = create_test_client()
+
+    response = client.get(
+        "/live/hotspots?lon=-75.16&lat=39.95&radius_m=2000&window_days=14"
+    )
+
+    collection = mongo.database.collections["live_hotspots"]
+    assert response.status_code == 200
+    assert response.json["window_days"] == 14
+    assert collection.query["hotspot"] is True
+    assert collection.query["location"]["$near"]["$maxDistance"] == 2000
+    assert collection.query["window_end"]["$gte"] == datetime(
+        2022, 1, 17, tzinfo=timezone.utc
+    )
+
+    all_windows = client.get(
+        "/live/hotspots?lon=-75.16&lat=39.95&radius_m=2000"
+        "&window_days=365&include_all=true"
+    )
+    assert all_windows.status_code == 200
+    assert "hotspot" not in collection.query
+    assert client.get(
+        "/live/hotspots?lon=-75.16&lat=39.95&radius_m=100&include_all=yes"
+    ).status_code == 400
+
+
+def test_alerts_support_radius_and_polygon_queries():
+    client, mongo = create_test_client()
+
+    near = client.get("/alerts?lon=-75.16&lat=39.95&radius_m=1000")
+    alerts = mongo.database.collections["alerts"]
+    assert near.status_code == 200
+    assert alerts.query["location"]["$near"]["$maxDistance"] == 1000
+
+    within = client.post("/alerts", json={"polygon": VALID_POLYGON, "limit": 2})
+    assert within.status_code == 200
+    assert alerts.query == {
+        "location": {"$geoWithin": {"$geometry": VALID_POLYGON}}
+    }
+
+
+def test_survival_category_returns_persisted_curve_and_rejects_small_group():
+    client, _ = create_test_client()
+
+    response = client.get("/survival/Italian")
+
+    assert response.status_code == 200
+    assert response.json["businesses"] == 25
+    assert response.json["points"][0]["at_risk"] == 25
+
+
+def test_survival_polygon_uses_geowithin_and_delayed_entry():
+    client, mongo = create_test_client()
+    first = datetime(2019, 1, 1, tzinfo=timezone.utc)
+    businesses = mongo.database.collections["businesses"]
+    businesses.documents = [
+        {
+            "business_id": f"b-{index}",
+            "is_open": 0,
+            "life": {
+                "first_review_date": first,
+                "last_review_date": datetime(2020, 1, 1, tzinfo=timezone.utc),
+            },
+        }
+        for index in range(20)
+    ]
+    polygon_argument = quote(json.dumps(VALID_POLYGON))
+
+    response = client.get(
+        f"/survival/Italian?polygon={polygon_argument}"
+    )
+
+    assert response.status_code == 200
+    assert businesses.query["location"] == {
+        "$geoWithin": {"$geometry": VALID_POLYGON}
+    }
+    assert response.json["delayed_entry"] is True
+    assert response.json["events"] == 20
+
+
+def test_risk_near_uses_geonear_and_joins_risk_scores():
+    client, mongo = create_test_client()
+
+    response = client.get("/risk/near?lon=-75.16&lat=39.95&radius_m=500")
+
+    businesses = mongo.database.collections["businesses"]
+    assert response.status_code == 200
+    assert businesses.pipeline[0]["$geoNear"]["maxDistance"] == 500
+    assert businesses.pipeline[1]["$lookup"]["from"] == "risk_scores"
