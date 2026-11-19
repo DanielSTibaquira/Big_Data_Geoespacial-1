@@ -11,16 +11,17 @@ pipeline {
     }
 
     parameters {
-        string(
-            name: 'COMPOSE_PROJECT_NAME',
-            defaultValue: 'parcial',
-            description: 'Existing Compose project that Jenkins will update.'
-        )
-    }
+     string(
+         name: 'COMPOSE_PROJECT_NAME',
+         defaultValue: 'big_data_geoespacial-1',
+         description: 'Existing Compose project that Jenkins will update.'
+     )
+ }
 
-    environment {
-        PYTHONDONTWRITEBYTECODE = '1'
-    }
+ environment {
+     PYTHONDONTWRITEBYTECODE = '1'
+     BRANCH_NAME = 'main'
+ }
 
     stages {
         stage('Checkout') {
