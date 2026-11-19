@@ -46,7 +46,7 @@ pipeline {
 
         stage('Yelp ingestion') {
             when {
-                branch 'main'
+                environment name: 'BRANCH_NAME', value: 'main'
             }
             steps {
                 withCredentials([file(credentialsId: 'kaggle-json', variable: 'KAGGLE_JSON')]) {
@@ -76,7 +76,7 @@ pipeline {
 
         stage('Spark sentiment and closure analytics') {
             when {
-                branch 'main'
+                environment name: 'BRANCH_NAME', value: 'main'
             }
             steps {
                 sh '''
@@ -106,7 +106,7 @@ pipeline {
 
         stage('E2 temporal sentiment model') {
             when {
-                branch 'main'
+                environment name: 'BRANCH_NAME', value: 'main'
             }
             steps {
                 sh '''
@@ -140,7 +140,7 @@ pipeline {
 
         stage('E2 survival and risk model') {
             when {
-                branch 'main'
+                environment name: 'BRANCH_NAME', value: 'main'
             }
             steps {
                 sh '''
@@ -416,7 +416,7 @@ PY
 
         stage('Deploy API') {
             when {
-                branch 'main'
+                environment name: 'BRANCH_NAME', value: 'main'
             }
             steps {
                 sh '''
