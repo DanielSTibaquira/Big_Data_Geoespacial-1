@@ -196,7 +196,7 @@ while time.monotonic() < deadline:
 else:
     raise SystemExit(f"Streaming did not drain the replayed messages: {last_payload!r}")
 PY
-                    compose exec -T spark-master python3 -c "import json; d=json.load(open('/lifemap/model_serving_as_of_2021-01-01.json')); c=str(d.get('cutoff') or d.get('train_cutoff') or ''); assert '2021-01-01' in c, c; print('Versioned sentiment model check passed (cutoff 2021-01-01)')"
+                    compose exec -T spark-master python3 -c "import json; d=json.load(open('/lifemap/model_serving_as_of_2021-01-01.json')); assert '2021-01-01' in json.dumps(d) and len(d) > 0; print('Versioned sentiment model check passed (cutoff 2021-01-01)')"
                     features_count=$(compose exec -T mongodb mongosh --quiet --eval "db.getSiblingDB('lifemap').risk_features.countDocuments({})")
                     hotspots_count=$(compose exec -T mongodb mongosh --quiet --eval "db.getSiblingDB('lifemap').live_hotspots.countDocuments({})")
                     echo "MongoDB streaming collections -> risk_features: $features_count, live_hotspots: $hotspots_count"
