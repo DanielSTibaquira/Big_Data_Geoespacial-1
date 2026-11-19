@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import json
 import math
 import os
 import socket
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -11,6 +13,7 @@ from pymongo import MongoClient
 from pymongo.errors import PyMongoError
 
 from api.sentiment import load_serving_model, predict_sentiment
+from api.e2_analytics import kaplan_meier, survival_observation
 
 RESULT_LIMIT = 500
 PROJECTION = {
@@ -145,6 +148,45 @@ def _geojson_polygon(value: Any) -> dict[str, Any]:
     return {"type": "Polygon", "coordinates": coordinates}
 
 
+def _kafka_consumer_lag(
+    bootstrap_servers: str,
+    topic: str,
+    processed_offsets: dict[str, int],
+) -> int | None:
+    from kafka import KafkaConsumer
+    from kafka.errors import KafkaError
+    from kafka.structs import TopicPartition
+
+    consumer = None
+    try:
+        consumer = KafkaConsumer(
+            bootstrap_servers=bootstrap_servers.split(","),
+            enable_auto_commit=False,
+            request_timeout_ms=2000,
+            api_version_auto_timeout_ms=2000,
+        )
+        partitions = consumer.partitions_for_topic(topic)
+        if not partitions:
+            return 0
+        topic_partitions = [
+            TopicPartition(topic, partition) for partition in sorted(partitions)
+        ]
+        end_offsets = consumer.end_offsets(topic_partitions)
+        return sum(
+            max(
+                0,
+                int(end_offsets[partition])
+                - (int(processed_offsets.get(str(partition.partition), -1)) + 1),
+            )
+            for partition in topic_partitions
+        )
+    except (KafkaError, OSError, TimeoutError):
+        return None
+    finally:
+        if consumer is not None:
+            consumer.close()
+
+
 def _bounding_polygon() -> dict[str, Any]:
     west = _number("min_lon", -180, 180)
     south = _number("min_lat", -90, 90)
@@ -190,6 +232,10 @@ def create_app(
     closure_rates = lifemap_database[
         os.getenv("LIFEMAP_CLOSURE_COLLECTION", "closure_rates")
     ]
+    live_hotspots = lifemap_database["live_hotspots"]
+    alerts = lifemap_database["alerts"]
+    survival_curves = lifemap_database["survival_curves"]
+    stream_status = lifemap_database["stream_status"]
     serving_model_path = model_path or Path(
         os.getenv("LIFEMAP_MODEL_PATH", "/lifemap/model_serving.json")
     )
@@ -206,6 +252,22 @@ def create_app(
             int(os.getenv("DASK_SCHEDULER_PORT", "8786")),
         ),
     }
+    app.config["KAFKA_BOOTSTRAP_SERVERS"] = os.getenv("KAFKA_BOOTSTRAP_SERVERS")
+    app.config["KAFKA_TOPIC"] = os.getenv("KAFKA_TOPIC", "reviews")
+    app.config["STREAMING_ENABLED"] = (
+        os.getenv("LIFEMAP_STREAMING_ENABLED", "false").strip().lower()
+        in {"1", "true", "yes"}
+    )
+    if app.config["KAFKA_BOOTSTRAP_SERVERS"]:
+        app.config["SERVICE_HOSTS"]["kafka"] = (
+            os.getenv("KAFKA_HOST", "kafka"),
+            int(os.getenv("KAFKA_PORT", "9092")),
+        )
+        if app.config["STREAMING_ENABLED"]:
+            app.config["SERVICE_HOSTS"]["streaming"] = (
+                os.getenv("LIFEMAP_STREAMING_HOST", "lifemap-streaming"),
+                int(os.getenv("LIFEMAP_STREAMING_PORT", "37801")),
+            )
 
     @app.errorhandler(PyMongoError)
     def handle_mongo_error(error: PyMongoError):
@@ -220,16 +282,38 @@ def create_app(
         services.update(
             {
                 name: (
-                "ok"
-                if probe(host, port)
-                else "unavailable"
+                    "ok"
+                    if probe(host, port)
+                    else "unavailable"
                 )
                 for name, (host, port) in app.config["SERVICE_HOSTS"].items()
             }
         )
+        lag = None
+        kafka_configured = bool(app.config["KAFKA_BOOTSTRAP_SERVERS"])
+        if kafka_configured and services.get("kafka") == "ok":
+            state = stream_status.find_one({"_id": "sentiment-consumer"}) or {}
+            lag = _kafka_consumer_lag(
+                app.config["KAFKA_BOOTSTRAP_SERVERS"],
+                app.config["KAFKA_TOPIC"],
+                state.get("offsets", {}),
+            )
+            if lag is None:
+                services["kafka"] = "unavailable"
+        if app.config["STREAMING_ENABLED"] and lag is None:
+            services["streaming"] = "unavailable"
+        consumer_lag = {
+            "messages": lag,
+            "status": "ok" if lag is not None else "not_ready",
+        }
         commit = os.getenv("GIT_COMMIT", "unknown")
         status = "ok" if all(value == "ok" for value in services.values()) else "degraded"
-        return jsonify(status=status, services=services, commit=commit), (
+        return jsonify(
+            status=status,
+            services=services,
+            consumer_lag=consumer_lag,
+            commit=commit,
+        ), (
             200 if status == "ok" else 503
         )
 
@@ -507,6 +591,234 @@ def create_app(
             min_days_business=minimum_days,
             results=results,
         )
+
+    @app.get("/live/hotspots")
+    def live_hotspots_near():
+        try:
+            longitude = _number("lon", -180, 180)
+            latitude = _number("lat", -90, 90)
+            radius = _number("radius_m", 1, 100_000)
+            window_days = _number("window_days", 1, 365, default=30)
+            limit = _limit()
+            include_all_value = request.args.get("include_all", "false").lower()
+            if include_all_value not in {"true", "false"}:
+                raise ValueError("Parameter include_all must be true or false")
+        except ValueError as error:
+            return jsonify(error=str(error)), 400
+        latest_window = next(
+            iter(
+                live_hotspots.find({}, {"window_end": 1})
+                .sort("window_end", -1)
+                .limit(1)
+            ),
+            None,
+        )
+        as_of = (latest_window or {}).get("window_end") or datetime.now(timezone.utc)
+        if as_of.tzinfo is None:
+            as_of = as_of.replace(tzinfo=timezone.utc)
+        cutoff = as_of - timedelta(days=window_days)
+        query = {
+            "window_end": {"$gte": cutoff},
+            "location": {
+                "$near": {
+                    "$geometry": {
+                        "type": "Point",
+                        "coordinates": [longitude, latitude],
+                    },
+                    "$maxDistance": radius,
+                }
+            },
+        }
+        if include_all_value == "false":
+            query["hotspot"] = True
+        live_hotspots.create_index(
+            [("location", "2dsphere")], name="location_2dsphere"
+        )
+        results = list(live_hotspots.find(query, {"_id": 0}).limit(limit))
+        return jsonify(
+            count=len(results),
+            window_days=window_days,
+            as_of=as_of,
+            hotspot_rule={
+                "minimum_reviews": 10,
+                "minimum_negative_fraction": 0.6,
+            },
+            results=results,
+        )
+
+    @app.route("/alerts", methods=["GET", "POST"])
+    def query_alerts():
+        if request.method == "GET":
+            try:
+                longitude = _number("lon", -180, 180)
+                latitude = _number("lat", -90, 90)
+                radius = _number("radius_m", 1, 100_000)
+                limit = _limit()
+            except ValueError as error:
+                return jsonify(error=str(error)), 400
+            query: dict[str, Any] = {
+                "location": {
+                    "$near": {
+                        "$geometry": {
+                            "type": "Point",
+                            "coordinates": [longitude, latitude],
+                        },
+                        "$maxDistance": radius,
+                    }
+                }
+            }
+        else:
+            body = request.get_json(silent=True)
+            if not isinstance(body, dict):
+                return jsonify(error="Request body must be a JSON object"), 400
+            try:
+                polygon = _geojson_polygon(body.get("polygon"))
+                limit = _parse_limit(body.get("limit", 100))
+            except ValueError as error:
+                return jsonify(error=str(error)), 400
+            query = {"location": {"$geoWithin": {"$geometry": polygon}}}
+        alerts.create_index([("location", "2dsphere")], name="location_2dsphere")
+        cursor = alerts.find(query, {"_id": 0})
+        if request.method == "POST":
+            cursor = cursor.sort("alerted_at", -1)
+        results = list(cursor.limit(limit))
+        return jsonify(count=len(results), results=results)
+
+    @app.get("/survival/<category>")
+    def survival_by_category(category: str):
+        category = category.strip()
+        if not category or len(category) > 80:
+            return jsonify(error="Category must contain 1 to 80 characters"), 400
+        polygon_value = request.args.get("polygon")
+        minimum_businesses = 20
+        try:
+            if "min_businesses" in request.args:
+                minimum_value = _number(
+                    "min_businesses", 20, 100_000, default=20
+                )
+                if not minimum_value.is_integer():
+                    raise ValueError("Parameter min_businesses must be an integer")
+                minimum_businesses = int(minimum_value)
+            polygon = (
+                _geojson_polygon(json.loads(polygon_value))
+                if polygon_value is not None
+                else None
+            )
+        except (ValueError, json.JSONDecodeError) as error:
+            return jsonify(error=f"Invalid survival parameters: {error}"), 400
+
+        if polygon is None:
+            curve = survival_curves.find_one(
+                {"_id": f"category:{category}"}, {"_id": 0}
+            )
+            if curve is None:
+                return jsonify(error="No survival curve found for this category"), 404
+            if curve.get("suppressed") or curve.get("businesses", 0) < minimum_businesses:
+                return jsonify(
+                    error="Insufficient businesses for a reliable curve",
+                    businesses=curve.get("businesses", 0),
+                    minimum_businesses=minimum_businesses,
+                ), 422
+            return jsonify(curve)
+
+        query = {
+            "primary_category": category,
+            "life.first_review_date": {"$ne": None},
+            "life.last_review_date": {"$ne": None},
+            "location": {"$geoWithin": {"$geometry": polygon}},
+        }
+        records = list(
+            businesses.find(
+                query,
+                {
+                    "_id": 0,
+                    "is_open": 1,
+                    "life.first_review_date": 1,
+                    "life.last_review_date": 1,
+                },
+            )
+        )
+        if len(records) < minimum_businesses:
+            return jsonify(
+                error="Insufficient businesses for a reliable curve",
+                businesses=len(records),
+                minimum_businesses=minimum_businesses,
+            ), 422
+        first_dates = [
+            record["life"]["first_review_date"]
+            for record in records
+            if record.get("life", {}).get("first_review_date") is not None
+        ]
+        origin = min(first_dates)
+        observations = [
+            survival_observation(
+                record["life"]["first_review_date"],
+                record["life"]["last_review_date"],
+                origin,
+                event=int(record.get("is_open", 1)) == 0,
+            )
+            for record in records
+        ]
+        return jsonify(
+            group_type="polygon",
+            category=category,
+            origin_date=origin,
+            delayed_entry=True,
+            lifetime_proxy="first-to-last review dates; not actual opening/closing dates",
+            **kaplan_meier(observations),
+        )
+
+    @app.get("/risk/near")
+    def risk_near():
+        try:
+            longitude = _number("lon", -180, 180)
+            latitude = _number("lat", -90, 90)
+            radius = _number("radius_m", 1, 100_000)
+            limit = _limit()
+        except ValueError as error:
+            return jsonify(error=str(error)), 400
+        businesses.create_index(
+            [("location", "2dsphere")], name="location_2dsphere"
+        )
+        pipeline = [
+            {
+                "$geoNear": {
+                    "near": {
+                        "type": "Point",
+                        "coordinates": [longitude, latitude],
+                    },
+                    "key": "location",
+                    "distanceField": "distance_m",
+                    "maxDistance": radius,
+                    "spherical": True,
+                }
+            },
+            {
+                "$lookup": {
+                    "from": "risk_scores",
+                    "localField": "business_id",
+                    "foreignField": "business_id",
+                    "as": "risk",
+                }
+            },
+            {"$unwind": "$risk"},
+            {
+                "$project": {
+                    "_id": 0,
+                    "business_id": 1,
+                    "name": 1,
+                    "primary_category": 1,
+                    "location": 1,
+                    "distance_m": 1,
+                    "risk_probability": "$risk.risk_probability",
+                    "label": "$risk.label",
+                }
+            },
+            {"$sort": {"risk_probability": -1}},
+            {"$limit": limit},
+        ]
+        results = list(businesses.aggregate(pipeline))
+        return jsonify(count=len(results), results=results)
 
     @app.post("/predict")
     def predict():

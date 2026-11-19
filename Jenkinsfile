@@ -86,6 +86,8 @@ pipeline {
                             --file "$WORKSPACE/docker-compose.yml" \
                             "$@"
                     }
+                    compose up --build --force-recreate --detach \
+                        spark-master spark-worker
                     compose exec -T spark-master sh -c 'mkdir -p /tmp/spark-ivy/cache'
                     compose exec -T spark-master \
                         /opt/spark/bin/spark-submit \
@@ -97,6 +99,67 @@ pipeline {
                         /opt/spark-apps/jobs/lifemap_batch.py \
                         --minimum-days-business 365 \
                         --report /lifemap/batch_report.json
+                '''
+            }
+        }
+
+        stage('E2 temporal sentiment model') {
+            when {
+                branch 'main'
+            }
+            steps {
+                sh '''
+                    set -eu
+                    compose() {
+                        docker-compose \
+                            --project-name "$COMPOSE_PROJECT_NAME" \
+                            --file "$WORKSPACE/docker-compose.yml" \
+                            "$@"
+                    }
+                    compose exec -T spark-master sh -c 'mkdir -p /tmp/spark-ivy/cache'
+                    compose exec -T spark-master \
+                        /opt/spark/bin/spark-submit \
+                        --master spark://spark-master:7077 \
+                        --executor-memory 1536m \
+                        --conf spark.executor.cores=1 \
+                        --packages org.mongodb.spark:mongo-spark-connector_2.12:10.7.0 \
+                        --conf spark.jars.ivy=/tmp/spark-ivy \
+                        --conf spark.mongodb.read.connection.uri=mongodb://mongodb:27017 \
+                        --conf spark.mongodb.write.connection.uri=mongodb://mongodb:27017 \
+                        /opt/spark-apps/jobs/lifemap_batch.py \
+                        --minimum-days-business 365 \
+                        --sentiment-train-cutoff 2021-01-01T00:00:00Z \
+                        --skip-benchmark \
+                        --model-dir /lifemap/models_as_of_2021-01-01 \
+                        --serving-model /lifemap/model_serving_as_of_2021-01-01.json \
+                        --report /lifemap/batch_report_as_of_2021-01-01.json
+                '''
+            }
+        }
+
+        stage('E2 survival and risk model') {
+            when {
+                branch 'main'
+            }
+            steps {
+                sh '''
+                    set -eu
+                    compose() {
+                        docker-compose \
+                            --project-name "$COMPOSE_PROJECT_NAME" \
+                            --file "$WORKSPACE/docker-compose.yml" \
+                            "$@"
+                    }
+                    compose exec -T spark-master sh -c 'mkdir -p /tmp/spark-ivy/cache'
+                    compose exec -T spark-master \
+                        /opt/spark/bin/spark-submit \
+                        --master spark://spark-master:7077 \
+                        --conf spark.driver.host=spark-master \
+                        --conf spark.driver.bindAddress=0.0.0.0 \
+                        /opt/spark-apps/jobs/lifemap_e2_analytics.py \
+                        --cutoff 2021-01-01T00:00:00Z \
+                        --risk-model /lifemap/risk_model_as_of_2021-01-01.json \
+                        --report /lifemap/e2_analytics_report.json
                 '''
             }
         }
@@ -128,9 +191,20 @@ pipeline {
                     }
                     trap cleanup_candidate EXIT
                     export GIT_COMMIT="$(git rev-parse HEAD)"
-                    compose --profile ci-deploy up --detach \
-                        mongodb dask-scheduler dask-worker-1 dask-worker-2 \
-                        spark-master spark-worker api-ci
+                    if [ "$BRANCH_NAME" = main ]; then
+                        export LIFEMAP_STREAMING_ENABLED=true
+                        compose --profile e2 --profile ci-deploy up --detach \
+                            mongodb kafka dask-scheduler dask-worker-1 dask-worker-2 \
+                            spark-master spark-worker lifemap-streaming api-ci
+                    else
+                        compose --profile ci-deploy up --detach \
+                            mongodb dask-scheduler dask-worker-1 dask-worker-2 \
+                            spark-master spark-worker api-ci
+                    fi
+                    if [ "$BRANCH_NAME" = main ]; then
+                        compose --profile e2 --profile jobs run --build --rm \
+                            replay-reviews --rate 1000 --limit 3
+                    fi
                     python3 - <<'PY'
 import json
 import os
@@ -146,7 +220,10 @@ while time.monotonic() < deadline:
             "http://api-ci:5000/health", timeout=3
         ) as response:
             payload = json.load(response)
-        if payload.get("status") == "ok":
+        if (
+            payload.get("status") == "ok"
+            and payload.get("commit") == os.environ.get("GIT_COMMIT")
+        ):
             print("Candidate API health check passed")
             break
         last_error = f"Unexpected health response: {payload!r}"
@@ -236,6 +313,39 @@ if not isinstance(payload.get("results"), list):
 print(f"Candidate Yelp closure stats smoke test passed ({payload['count']} groups)")
 
 if os.environ.get("BRANCH_NAME") == "main":
+    with urllib.request.urlopen(
+        "http://api-ci:5000/survival/Restaurants", timeout=15
+    ) as response:
+        payload = json.load(response)
+    if not isinstance(payload.get("points"), list):
+        raise SystemExit(f"Unexpected survival curve response: {payload!r}")
+    print("Candidate Kaplan-Meier API smoke test passed")
+
+    with urllib.request.urlopen(
+        "http://api-ci:5000/live/hotspots"
+        "?lon=-75.16&lat=39.95&radius_m=5000&window_days=30",
+        timeout=15,
+    ) as response:
+        payload = json.load(response)
+    if not isinstance(payload.get("results"), list):
+        raise SystemExit(f"Unexpected hotspot response: {payload!r}")
+
+    with urllib.request.urlopen(
+        "http://api-ci:5000/alerts?lon=-75.16&lat=39.95&radius_m=5000",
+        timeout=15,
+    ) as response:
+        payload = json.load(response)
+    if not isinstance(payload.get("results"), list):
+        raise SystemExit(f"Unexpected alert response: {payload!r}")
+
+    with urllib.request.urlopen(
+        "http://api-ci:5000/risk/near?lon=-75.16&lat=39.95&radius_m=5000",
+        timeout=15,
+    ) as response:
+        payload = json.load(response)
+    if not isinstance(payload.get("results"), list):
+        raise SystemExit(f"Unexpected risk response: {payload!r}")
+
     request = urllib.request.Request(
         "http://api-ci:5000/predict",
         data=json.dumps({"text": "Great food and friendly service"}).encode(),
@@ -253,7 +363,29 @@ if os.environ.get("BRANCH_NAME") == "main":
     }:
         raise SystemExit(f"Unexpected Yelp prediction probabilities: {payload!r}")
     print("Candidate Yelp sentiment prediction smoke test passed")
+
 PY
+                    if [ "$BRANCH_NAME" = main ]; then
+                        python3 - <<'PY'
+import json
+import time
+import urllib.request
+
+deadline = time.monotonic() + 120
+last_payload = None
+while time.monotonic() < deadline:
+    with urllib.request.urlopen("http://api-ci:5000/health", timeout=5) as response:
+        last_payload = json.load(response)
+    services = last_payload.get("services", {})
+    lag = last_payload.get("consumer_lag", {}).get("messages")
+    if services.get("kafka") == "ok" and services.get("streaming") == "ok" and lag == 0:
+        print("Kafka-to-Mongo streaming smoke test passed")
+        break
+    time.sleep(2)
+else:
+    raise SystemExit(f"Streaming did not drain the replayed messages: {last_payload!r}")
+PY
+                    fi
                     cleanup_candidate
                     trap - EXIT
                 '''
@@ -268,10 +400,12 @@ PY
                 sh '''
                     set -eu
                     export GIT_COMMIT="$(git rev-parse HEAD)"
+                    export LIFEMAP_STREAMING_ENABLED=true
                     docker-compose \
                         --project-name "$COMPOSE_PROJECT_NAME" \
                         --file "$WORKSPACE/docker-compose.yml" \
-                        up --detach --no-deps api
+                        --profile e2 \
+                        up --detach api lifemap-streaming
                 '''
             }
         }

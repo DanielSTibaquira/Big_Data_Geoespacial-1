@@ -38,6 +38,31 @@ def encode_geohash(latitude: float, longitude: float, precision: int = 5) -> str
     return "".join(encoded)
 
 
+def geohash_center(value: str) -> dict[str, float]:
+    if not value:
+        raise ValueError("Geohash must not be empty")
+    latitude_range = [-90.0, 90.0]
+    longitude_range = [-180.0, 180.0]
+    longitude_turn = True
+    for character in value:
+        try:
+            encoded = GEOHASH_BASE32.index(character)
+        except ValueError as error:
+            raise ValueError(f"Invalid geohash character: {character}") from error
+        for mask in (16, 8, 4, 2, 1):
+            current_range = longitude_range if longitude_turn else latitude_range
+            midpoint = sum(current_range) / 2
+            if encoded & mask:
+                current_range[0] = midpoint
+            else:
+                current_range[1] = midpoint
+            longitude_turn = not longitude_turn
+    return {
+        "longitude": sum(longitude_range) / 2,
+        "latitude": sum(latitude_range) / 2,
+    }
+
+
 def annualized_closure_rate(closures: int, days_business: float) -> float | None:
     if closures < 0 or days_business < 0:
         raise ValueError("Closures and business exposure must be non-negative")

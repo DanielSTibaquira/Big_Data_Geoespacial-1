@@ -67,6 +67,66 @@ El job separa entrenamiento y prueba por `business_id` (80/20 determinista), ent
 
 Compose construye `lifemap-spark:3.5.7` con NumPy 1.24.4, requerido por MLlib; el worker anuncia 2 GB y el comando reserva 1536 MB para el executor.
 
+### Modelo congelado para la Entrega 2
+
+Para evitar fuga temporal, el modelo de sentimiento de E2 se entrena solo con reseñas fechadas hasta `2021-01-01T00:00:00Z` (inclusive). Este comando guarda sus artefactos con nombres versionados bajo `data/lifemap/`, sin reemplazar el modelo de E1 ni el reporte habitual:
+
+```powershell
+docker compose exec spark-master sh -c 'mkdir -p /tmp/spark-ivy/cache && /opt/spark/bin/spark-submit --master spark://spark-master:7077 --executor-memory 1536m --conf spark.executor.cores=1 --packages org.mongodb.spark:mongo-spark-connector_2.12:10.7.0 --conf spark.jars.ivy=/tmp/spark-ivy --conf spark.mongodb.read.connection.uri=mongodb://mongodb:27017 --conf spark.mongodb.write.connection.uri=mongodb://mongodb:27017 /opt/spark-apps/jobs/lifemap_batch.py --minimum-days-business 365 --sentiment-train-cutoff 2021-01-01T00:00:00Z --skip-benchmark --model-dir /lifemap/models_as_of_2021-01-01 --serving-model /lifemap/model_serving_as_of_2021-01-01.json --report /lifemap/batch_report_as_of_2021-01-01.json'
+```
+
+El reporte registra el corte UTC y cuántas reseñas fueron excluidas por ser posteriores al corte. El productor E2 lee solo reseñas posteriores a T y el consumidor de Structured Streaming carga este modelo congelado; el flujo no lo reentrena. La API de E1 continúa usando `model_serving.json`.
+
+## Entrega 2: Kafka, streaming y supervivencia
+
+La Entrega 2 agrega Kafka en modo KRaft, replay temporal, inferencia con Spark Structured Streaming, ventanas geohash, curvas Kaplan–Meier, modelo de riesgo y alertas. El perfil `e2` evita iniciar el streaming automáticamente al levantar E1. Antes de usarlo, deben existir las colecciones Yelp y los artefactos temporales de sentimiento.
+
+Desde la raíz del proyecto:
+
+```powershell
+# En una instalación nueva, descarga e ingesta Yelp si MongoDB aún no tiene los datos.
+docker compose --profile jobs run --build --rm yelp-ingest --report /data/yelp_ingestion_report.json
+
+# Entrena y exporta el modelo de sentimiento limitado a T siguiendo el comando de arriba.
+
+# Calcula curvas de supervivencia y entrena el modelo de riesgo.
+docker compose --profile jobs run --build --rm lifemap-e2-analytics
+
+# Levanta Kafka, topic y streaming.
+$env:LIFEMAP_STREAMING_ENABLED = "true"
+docker compose --profile e2 up --build -d
+docker compose --profile e2 ps
+```
+
+Kafka crea el topic `reviews` con tres particiones. El job `lifemap-e2-analytics` construye las curvas y el clasificador de riesgo antes de iniciar el perfil de streaming. Structured Streaming procesa reseñas con checkpoint persistente en `data/lifemap/checkpoints/`. La reproducción de prueba se limita a diez reseñas:
+
+```powershell
+docker compose --profile e2 --profile jobs run --build --rm replay-reviews --rate 5 --limit 10
+```
+
+Para la demostración, se puede aumentar la velocidad con `--rate` y omitir `--limit` para reproducir todas las reseñas posteriores a T. El productor ordena por fecha y publica usando `business_id` como clave. El consumidor guarda sentimiento predicho, probabilidades, hora de procesamiento y lote; los upserts por `review_id` permiten reintentar sin duplicar reseñas. Reiniciar el productor vuelve a publicar el rango post-T; Spark conserva su checkpoint y los upserts son idempotentes.
+
+El watermark es de 7 días y las ventanas de geohash son de 30 días. Se marca hotspot cuando hay al menos 10 reseñas en la ventana y al menos 60 % son negativas según el clasificador congelado: el mínimo reduce alertas por celdas con pocas observaciones y el porcentaje identifica concentración de experiencia negativa. Las coordenadas guardadas son el centro de la celda geohash.
+
+El job de riesgo usa reseñas hasta T para las variables base, actividad después de T para construir la etiqueta a 12 meses y excluye negocios sin actividad post-T. La regresión logística pondera clases inversamente a su frecuencia; el corte de alerta por defecto es 0,5 y se reportan AUC-ROC, AUC-PR y recall. La densidad de competidores usa `$geoNear` con radio de 500 m y categoría principal. Las curvas tratan los negocios abiertos como censurados y usan la primera reseña como entrada tardía; primera/última reseña son proxies, no fechas reales de apertura y cierre. Grupos con menos de 20 negocios se suprimen.
+
+Con el perfil E2 activo, `/health` añade Kafka, estado del stream y retraso del consumidor en offsets. Endpoints nuevos:
+
+```text
+GET  /live/hotspots?lon=-75.16&lat=39.95&radius_m=5000&window_days=30
+GET  /alerts?lon=-75.16&lat=39.95&radius_m=5000
+POST /alerts  {"polygon":{"type":"Polygon","coordinates":[...]}, "limit":100}
+GET  /survival/Italian
+GET  /survival/Italian?polygon=<GeoJSON codificado en URL>
+GET  /risk/near?lon=-75.16&lat=39.95&radius_m=5000
+```
+
+`/live/hotspots` acepta `include_all=true` para devolver también ventanas que no cruzan el umbral, útil para graficar la evolución del porcentaje negativo. Las alertas se consultan por radio o polígono; `/survival/<categoria>` acepta un polígono GeoJSON serializado en el parámetro `polygon` para calcular la curva de la zona usando `$geoWithin`. Las consultas geoespaciales requieren índices 2dsphere.
+
+Las consultas M de [docs/powerbi/](./docs/powerbi/) conectan Power BI a hotspots, alertas, supervivencia y evolución del porcentaje negativo. En Power BI Desktop crea una consulta en blanco por archivo, pega su contenido en el Editor avanzado y cambia `BaseUrl` por la URL pública desplegada. Configura cuatro visualizaciones (mapa, tabla de alertas, curva de supervivencia y serie temporal) y actualízalas durante la demo. Los archivos `.pq` son consultas de origen; el archivo `.pbix` y la publicación en Power BI deben crearse en Power BI Desktop.
+
+Jenkins en `main` ejecuta la ingesta, entrena ambos modelos temporales, calcula supervivencia/riesgo, levanta el candidato E2, publica reseñas de humo y espera a que el retraso Kafka llegue a cero antes de desplegar. La prueba falla y bloquea el despliegue si falla la API, el streaming, las métricas o el modelo.
+
 ## API LifeMap
 
 La página principal (`http://localhost:5000/`) ofrece un mapa Leaflet de restaurantes de Philadelphia, búsqueda por radio/categoría, resumen de tasas y sentimiento de la zona, y una prueba interactiva del modelo `/predict`. Haz clic en el mapa para mover el centro y luego pulsa **Buscar en el mapa**. El explorador de taxis anterior sigue disponible en `http://localhost:5000/taxi`. Leaflet, las fuentes y las teselas de OpenStreetMap se cargan desde servicios externos, por lo que la interfaz cartográfica requiere Internet.

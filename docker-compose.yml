@@ -14,6 +14,52 @@ services:
       timeout: 5s
       retries: 5
 
+  kafka:
+    image: apache/kafka:3.9.1
+    restart: unless-stopped
+    environment:
+      KAFKA_NODE_ID: "1"
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: "1"
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: "1"
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: "1"
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: "0"
+      KAFKA_NUM_PARTITIONS: "3"
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+      KAFKA_CLUSTER_ID: MkU3OEVBNTcwNTJENDM2Qk
+      KAFKA_LOG_DIRS: /var/lib/kafka/data
+    volumes:
+      - kafka_data:/var/lib/kafka/data
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list >/dev/null 2>&1"]
+      interval: 10s
+      timeout: 10s
+      retries: 12
+
+  kafka-create-topic:
+    image: apache/kafka:3.9.1
+    profiles: ["e2"]
+    depends_on:
+      kafka:
+        condition: service_healthy
+    entrypoint: ["/opt/kafka/bin/kafka-topics.sh"]
+    command:
+      - --bootstrap-server
+      - kafka:9092
+      - --create
+      - --if-not-exists
+      - --topic
+      - reviews
+      - --partitions
+      - "3"
+      - --replication-factor
+      - "1"
+
   dask-scheduler:
     image: daskdev/dask:2026.8.0-py3.12
     restart: unless-stopped
@@ -69,6 +115,7 @@ services:
       SPARK_MASTER_HOST: spark-master
       SPARK_MASTER_PORT: "7077"
       SPARK_MASTER_WEBUI_PORT: "8080"
+      PYTHONPATH: /opt
     command:
       - /opt/spark/bin/spark-class
       - org.apache.spark.deploy.master.Master
@@ -81,6 +128,7 @@ services:
       - ./data:/data:ro
       - ./data/lifemap:/lifemap
       - ./benchmark/results:/results
+      - ./api:/opt/api:ro
 
   spark-worker:
     image: lifemap-spark:3.5.7
@@ -92,6 +140,7 @@ services:
       SPARK_WORKER_CORES: "1"
       SPARK_WORKER_MEMORY: 2g
       SPARK_WORKER_WEBUI_PORT: "8081"
+      PYTHONPATH: /opt
     command:
       - /opt/spark/bin/spark-class
       - org.apache.spark.deploy.worker.Worker
@@ -105,6 +154,81 @@ services:
       - ./benchmark:/opt/benchmark:ro
       - ./data:/data:ro
       - ./data/lifemap:/lifemap
+      - ./api:/opt/api:ro
+
+  lifemap-streaming:
+    image: lifemap-spark:3.5.7
+    profiles: ["e2"]
+    restart: unless-stopped
+    environment:
+      PYTHONPATH: /opt
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      KAFKA_TOPIC: reviews
+      MONGO_URI: mongodb://mongodb:27017
+      LIFEMAP_DATABASE: lifemap
+      LIFEMAP_MODEL_PATH: /lifemap/model_serving_as_of_2021-01-01.json
+      LIFEMAP_RISK_MODEL_PATH: /lifemap/risk_model_as_of_2021-01-01.json
+      LIFEMAP_CHECKPOINT_ROOT: /lifemap/checkpoints
+      SPARK_LOCAL_HOSTNAME: lifemap-streaming
+    command:
+      - /opt/spark/bin/spark-submit
+      - --master
+      - spark://spark-master:7077
+      - --packages
+      - org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.7,org.mongodb.spark:mongo-spark-connector_2.12:10.7.0
+      - --conf
+      - spark.jars.ivy=/tmp/spark-ivy
+      - --conf
+      - spark.driver.host=lifemap-streaming
+      - --conf
+      - spark.driver.bindAddress=0.0.0.0
+      - --conf
+      - spark.driver.port=37801
+      - --conf
+      - spark.blockManager.port=37802
+      - --conf
+      - spark.executor.memory=1536m
+      - /opt/spark-apps/jobs/lifemap_streaming.py
+    depends_on:
+      kafka-create-topic:
+        condition: service_completed_successfully
+      mongodb:
+        condition: service_healthy
+      spark-master:
+        condition: service_started
+      spark-worker:
+        condition: service_started
+    expose:
+      - "37801"
+      - "37802"
+    volumes:
+      - ./spark:/opt/spark-apps:ro
+      - ./data/lifemap:/lifemap
+      - ./api:/opt/api:ro
+
+  lifemap-e2-analytics:
+    image: lifemap-spark:3.5.7
+    build:
+      context: ./spark
+    profiles:
+      - jobs
+    environment:
+      PYTHONPATH: /opt
+      MONGO_URI: mongodb://mongodb:27017
+      LIFEMAP_DATABASE: lifemap
+      LIFEMAP_TRAINING_CUTOFF: "2021-01-01T00:00:00Z"
+    command:
+      - /opt/spark/bin/spark-submit
+      - --master
+      - local[2]
+      - /opt/spark-apps/jobs/lifemap_e2_analytics.py
+    depends_on:
+      mongodb:
+        condition: service_healthy
+    volumes:
+      - ./spark:/opt/spark-apps:ro
+      - ./data/lifemap:/lifemap
+      - ./api:/opt/api:ro
 
   api:
     image: taxi-geospatial-api:local
@@ -123,6 +247,9 @@ services:
       LIFEMAP_MODEL_PATH: /lifemap/model_serving.json
       SPARK_MASTER_HOST: spark-master
       DASK_SCHEDULER_HOST: dask-scheduler
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      KAFKA_TOPIC: reviews
+      LIFEMAP_STREAMING_ENABLED: ${LIFEMAP_STREAMING_ENABLED:-false}
       GIT_COMMIT: ${GIT_COMMIT:-unknown}
     ports:
       - "127.0.0.1:5000:5000"
@@ -135,6 +262,8 @@ services:
         condition: service_started
       spark-master:
         condition: service_started
+      kafka:
+        condition: service_healthy
 
   benchmark-dask:
     image: daskdev/dask:2026.8.0-py3.12
@@ -180,6 +309,9 @@ services:
       LIFEMAP_MODEL_PATH: /lifemap/model_serving.json
       SPARK_MASTER_HOST: spark-master
       DASK_SCHEDULER_HOST: dask-scheduler
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      KAFKA_TOPIC: reviews
+      LIFEMAP_STREAMING_ENABLED: ${LIFEMAP_STREAMING_ENABLED:-false}
       GIT_COMMIT: ${GIT_COMMIT:-unknown}
     volumes:
       - ./data/lifemap:/lifemap:ro
@@ -190,6 +322,8 @@ services:
         condition: service_started
       spark-master:
         condition: service_started
+      kafka:
+        condition: service_healthy
 
   jenkins:
     build:
@@ -260,6 +394,25 @@ services:
       dask-worker-2:
         condition: service_started
 
+  replay-reviews:
+    build:
+      context: ./ingestion
+    profiles:
+      - jobs
+    entrypoint: ["python", "-m", "ingestion.replay_reviews"]
+    environment:
+      MONGO_URI: mongodb://mongodb:27017
+      LIFEMAP_DATABASE: lifemap
+      LIFEMAP_TRAINING_CUTOFF: "2021-01-01T00:00:00Z"
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      KAFKA_TOPIC: reviews
+    depends_on:
+      mongodb:
+        condition: service_healthy
+      kafka-create-topic:
+        condition: service_completed_successfully
+
 volumes:
   mongodb_data:
   jenkins_home:
+  kafka_data:
