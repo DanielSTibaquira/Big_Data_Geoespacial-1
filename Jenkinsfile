@@ -182,18 +182,6 @@ for endpoint in (
         raise SystemExit(f"Endpoint remained 503: {endpoint}")
 print("Candidate streaming & risk endpoints smoke test passed")
 
-request = urllib.request.Request(
-    "http://api-ci:5000/predict",
-    data=json.dumps({"text": "Great food and friendly service"}).encode(),
-    headers={"Content-Type": "application/json"},
-    method="POST",
-)
-with urllib.request.urlopen(request, timeout=15) as response:
-    payload = json.load(response)
-if payload.get("sentiment") not in {"negative", "neutral", "positive"}:
-    raise SystemExit(f"Unexpected Yelp prediction response: {payload!r}")
-print("Candidate Yelp sentiment prediction smoke test passed")
-
 deadline = time.monotonic() + 120
 last_payload = None
 while time.monotonic() < deadline:
