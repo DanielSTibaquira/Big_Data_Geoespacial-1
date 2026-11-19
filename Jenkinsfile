@@ -162,30 +162,25 @@ if not isinstance(payload.get("points"), list):
     raise SystemExit(f"Unexpected survival curve response: {payload!r}")
 print("Candidate Kaplan-Meier API smoke test passed")
 
-with urllib.request.urlopen(
-    "http://api-ci:5000/live/hotspots"
-    "?lon=-75.16&lat=39.95&radius_m=25000&window_days=30",
-    timeout=15,
-) as response:
-    payload = json.load(response)
-if not isinstance(payload.get("results"), list):
-    raise SystemExit(f"Unexpected hotspot response: {payload!r}")
-
-with urllib.request.urlopen(
+for endpoint in (
+    "http://api-ci:5000/live/hotspots?lon=-75.16&lat=39.95&radius_m=25000&window_days=30",
     "http://api-ci:5000/alerts?lon=-75.16&lat=39.95&radius_m=25000",
-    timeout=15,
-) as response:
-    payload = json.load(response)
-if not isinstance(payload.get("results"), list):
-    raise SystemExit(f"Unexpected alert response: {payload!r}")
-
-with urllib.request.urlopen(
     "http://api-ci:5000/risk/near?lon=-75.16&lat=39.95&radius_m=25000",
-    timeout=15,
-) as response:
-    payload = json.load(response)
-if not isinstance(payload.get("results"), list):
-    raise SystemExit(f"Unexpected risk response: {payload!r}")
+):
+    end_t = time.monotonic() + 30
+    while time.monotonic() < end_t:
+        try:
+            with urllib.request.urlopen(endpoint, timeout=15) as response:
+                payload = json.load(response)
+            if isinstance(payload.get("results"), list):
+                break
+        except urllib.error.HTTPError as err:
+            if err.code != 503:
+                raise
+            time.sleep(2)
+    else:
+        raise SystemExit(f"Endpoint remained 503: {endpoint}")
+print("Candidate streaming & risk endpoints smoke test passed")
 
 request = urllib.request.Request(
     "http://api-ci:5000/predict",
